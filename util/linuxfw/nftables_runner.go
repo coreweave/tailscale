@@ -1181,33 +1181,28 @@ func createRangeRule(
 
 }
 
-// addReturnChromeOSVMRangeRule adds a rule to return if the source IP
-// is in the ChromeOS VM range.
-func addReturnChromeOSVMRangeRule(c *nftables.Conn, table *nftables.Table, chain *nftables.Chain, tunname string) error {
-	rule, err := createRangeRule(table, chain, tunname, tsaddr.ChromeOSVMRange(), expr.VerdictReturn)
-	if err != nil {
-		return fmt.Errorf("create rule: %w", err)
-	}
-	_ = c.AddRule(rule)
-	if err = c.Flush(); err != nil {
-		return fmt.Errorf("add rule: %w", err)
-	}
-	return nil
-}
-
 // addReturnCGNATOverrideRange adds a rule to return if the source IP
 // CGNAT Override range.
 func addReturnCGNATOverrideRange(c *nftables.Conn, table *nftables.Table, chain *nftables.Chain, tunname string) error {
+	var errs []error
 	CGNatOverrideRange := tsaddr.CGNatOverrideRange()
-	if CGNatOverrideRange.IsValid() {
-		rule, err := createRangeRule(table, chain, tunname, tsaddr.CGNatOverrideRange(), expr.VerdictReturn)
-		if err != nil {
-			return fmt.Errorf("create rule: %w", err)
+	for _, prefix := range CGNatOverrideRange {
+		if prefix.IsValid() {
+			rule, err := createRangeRule(table, chain, tunname, prefix, expr.VerdictReturn)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("create rule for prefix %v: %w", prefix, err))
+				continue
+			}
+			_ = c.AddRule(rule)
+			if err = c.Flush(); err != nil {
+				errs = append(errs, fmt.Errorf("add rule for prefix %v: %w", prefix, err))
+				continue
+			}
 		}
-		_ = c.AddRule(rule)
-		if err = c.Flush(); err != nil {
-			return fmt.Errorf("add rule: %w", err)
-		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("encountered multiple errors: %v", errs)
 	}
 	return nil
 }
@@ -1545,9 +1540,6 @@ func (n *nftablesRunner) addBase4(tunname string) error {
 	inputChain, err := getChainFromTable(conn, n.nft4.Filter, chainNameInput)
 	if err != nil {
 		return fmt.Errorf("get input chain v4: %v", err)
-	}
-	if err = addReturnChromeOSVMRangeRule(conn, n.nft4.Filter, inputChain, tunname); err != nil {
-		return fmt.Errorf("add return chromeos vm range rule v4: %w", err)
 	}
 	if err = addReturnCGNATOverrideRange(conn, n.nft4.Filter, inputChain, tunname); err != nil {
 		return fmt.Errorf("add return cgnat override range rule v4: %w", err)

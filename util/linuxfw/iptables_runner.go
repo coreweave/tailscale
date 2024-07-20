@@ -321,15 +321,19 @@ func (i *iptablesRunner) addBase4(tunname string) error {
 	//
 	// Note, this will definitely break nodes that end up using the
 	// CGNAT range for other purposes :(.
-	args := []string{"!", "-i", tunname, "-s", tsaddr.ChromeOSVMRange().String(), "-j", "RETURN"}
-	if err := i.ipt4.Append("filter", "ts-input", args...); err != nil {
-		return fmt.Errorf("adding %v in v4/filter/ts-input: %w", args, err)
-	}
+	var args []string
+	var errs []error
 	CGNatOverrideRange := tsaddr.CGNatOverrideRange()
-	if CGNatOverrideRange.IsValid() {
-		args = []string{"!", "-i", tunname, "-s", tsaddr.CGNatOverrideRange().String(), "-j", "RETURN"}
-		if err := i.ipt4.Append("filter", "ts-input", args...); err != nil {
-			return fmt.Errorf("adding %v in v4/filter/ts-input: %w", args, err)
+	for _, prefix := range CGNatOverrideRange {
+		if prefix.IsValid() {
+			args = []string{"!", "-i", tunname, "-s", prefix.String(), "-j", "RETURN"}
+			if err := i.ipt4.Append("filter", "ts-input", args...); err != nil {
+				errs = append(errs, fmt.Errorf("adding %v in v4/filter/ts-input: %w", args, err))
+				continue
+			}
+		}
+		if len(errs) > 0 {
+			return fmt.Errorf("encountered multiple errors: %v", errs)
 		}
 	}
 	args = []string{"!", "-i", tunname, "-s", tsaddr.CGNATRange().String(), "-j", "DROP"}
