@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"net/netip"
+	"os"
 	"slices"
 	"sync"
 
@@ -24,7 +25,19 @@ func ChromeOSVMRange() netip.Prefix {
 	return chromeOSRange.v
 }
 
+// CGNatOverrideRange returns the subset of the CGNAT IPv4 range that
+// is passed via env var to ACCEPT traffic over the 100.64.0.0/10 DROP
+func CGNatOverrideRange() netip.Prefix {
+	CGNatOverrideRange := os.Getenv("TS_CGNAT_OVERRIDE_RANGE")
+	if CGNatOverrideRange != "" {
+		cgNatOverrideRange.Do(func() { mustPrefix(&cgNatOverrideRange.v, CGNatOverrideRange) })
+		return cgNatOverrideRange.v
+	}
+	return netip.Prefix{}
+}
+
 var chromeOSRange oncePrefix
+var cgNatOverrideRange oncePrefix
 
 // CGNATRange returns the Carrier Grade NAT address range that
 // is the superset range that Tailscale assigns out of.

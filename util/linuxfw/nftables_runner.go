@@ -1195,6 +1195,23 @@ func addReturnChromeOSVMRangeRule(c *nftables.Conn, table *nftables.Table, chain
 	return nil
 }
 
+// addReturnCGNATOverrideRange adds a rule to return if the source IP
+// CGNAT Override range.
+func addReturnCGNATOverrideRange(c *nftables.Conn, table *nftables.Table, chain *nftables.Chain, tunname string) error {
+	CGNatOverrideRange := tsaddr.CGNatOverrideRange()
+	if CGNatOverrideRange.IsValid() {
+		rule, err := createRangeRule(table, chain, tunname, tsaddr.CGNatOverrideRange(), expr.VerdictReturn)
+		if err != nil {
+			return fmt.Errorf("create rule: %w", err)
+		}
+		_ = c.AddRule(rule)
+		if err = c.Flush(); err != nil {
+			return fmt.Errorf("add rule: %w", err)
+		}
+	}
+	return nil
+}
+
 // addDropCGNATRangeRule adds a rule to drop if the source IP is in the
 // CGNAT range.
 func addDropCGNATRangeRule(c *nftables.Conn, table *nftables.Table, chain *nftables.Chain, tunname string) error {
@@ -1531,6 +1548,9 @@ func (n *nftablesRunner) addBase4(tunname string) error {
 	}
 	if err = addReturnChromeOSVMRangeRule(conn, n.nft4.Filter, inputChain, tunname); err != nil {
 		return fmt.Errorf("add return chromeos vm range rule v4: %w", err)
+	}
+	if err = addReturnCGNATOverrideRange(conn, n.nft4.Filter, inputChain, tunname); err != nil {
+		return fmt.Errorf("add return cgnat override range rule v4: %w", err)
 	}
 	if err = addDropCGNATRangeRule(conn, n.nft4.Filter, inputChain, tunname); err != nil {
 		return fmt.Errorf("add drop cgnat range rule v4: %w", err)
