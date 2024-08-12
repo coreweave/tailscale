@@ -1961,7 +1961,12 @@ func (b *LocalBackend) updateFilterLocked(netMap *netmap.NetworkMap, prefs ipn.P
 	// Log traffic for Tailscale IPs.
 	logNetsB.AddPrefix(tsaddr.CGNATRange())
 	logNetsB.AddPrefix(tsaddr.TailscaleULARange())
-	logNetsB.RemovePrefix(tsaddr.ChromeOSVMRange())
+	for _, prefix := range tsaddr.CGNatOverrideRange() {
+		if prefix.IsValid() {
+			logNetsB.AddPrefix(prefix)
+
+		}
+	}
 	if haveNetmap {
 		addrs = netMap.GetAddresses()
 		for i := range addrs.Len() {
