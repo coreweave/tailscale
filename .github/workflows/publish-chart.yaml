@@ -40,6 +40,11 @@ jobs:
       - name: Install Helm
         uses: azure/setup-helm@v4
 
+      - name: Package CRDs
+        shell: bash
+        run: |
+          cp cmd/k8s-operator/deploy/crds cmd/k8s-operator/deploy/chart
+
       - name: Package & Push Helm Charts
         shell: bash
         run: |
