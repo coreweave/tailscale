@@ -34,7 +34,7 @@ jobs:
         run: echo "VERSION=$(cat VERSION.txt)" >> $GITHUB_ENV
 
       - name: Set HELM_VERSION
-        run: echo "HELM_VERSION=${{ env.VERSION }}-${GITHUB_SHA::7}" >> $GITHUB_ENV
+        run: echo "HELM_VERSION=v${{ env.VERSION }}-${GITHUB_SHA::7}" >> $GITHUB_ENV
 
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
