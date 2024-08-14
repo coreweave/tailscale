@@ -49,16 +49,7 @@ jobs:
       - name: Package CRDs
         shell: bash
         run: |
-          cat <<EOF > cmd/k8s-operator/deploy/chart/templates/crds.yaml
-          {{- if .Values.installCRDs }}
-          EOF
-          for file in cmd/k8s-operator/deploy/crds/*.yaml; do
-            echo "---" >> cmd/k8s-operator/deploy/chart/templates/crds.yaml
-            cat "$file" >> cmd/k8s-operator/deploy/chart/templates/crds.yaml
-          done
-          cat <<EOF >> cmd/k8s-operator/deploy/chart/templates/crds.yaml
-          {{- end }}
-          EOF
+          cp -r cmd/k8s-operator/deploy/crds cmd/k8s-operator/deploy/chart
 
       - name: Package & Push Helm Charts
         shell: bash
