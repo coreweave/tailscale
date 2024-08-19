@@ -69,6 +69,14 @@ type LocalClient struct {
 	// connecting to the GUI client variants.
 	UseSocketOnly bool
 
+	// OmitAuth, if true, omits sending the local Tailscale daemon any
+	// authentication token that might be required by the platform.
+	//
+	// As of 2024-08-12, only macOS uses an authentication token. OmitAuth is
+	// meant for when Dial is set and the LocalAPI is being proxied to a
+	// different operating system, such as in integration tests.
+	OmitAuth bool
+
 	// tsClient does HTTP requests to the local Tailscale daemon.
 	// It's lazily initialized on first use.
 	tsClient     *http.Client
@@ -124,8 +132,10 @@ func (lc *LocalClient) DoLocalRequest(req *http.Request) (*http.Response, error)
 			},
 		}
 	})
-	if _, token, err := safesocket.LocalTCPPortAndToken(); err == nil {
-		req.SetBasicAuth("", token)
+	if !lc.OmitAuth {
+		if _, token, err := safesocket.LocalTCPPortAndToken(); err == nil {
+			req.SetBasicAuth("", token)
+		}
 	}
 	return lc.tsClient.Do(req)
 }
@@ -933,7 +943,20 @@ func CertPair(ctx context.Context, domain string) (certPEM, keyPEM []byte, err e
 //
 // API maturity: this is considered a stable API.
 func (lc *LocalClient) CertPair(ctx context.Context, domain string) (certPEM, keyPEM []byte, err error) {
-	res, err := lc.send(ctx, "GET", "/localapi/v0/cert/"+domain+"?type=pair", 200, nil)
+	return lc.CertPairWithValidity(ctx, domain, 0)
+}
+
+// CertPairWithValidity returns a cert and private key for the provided DNS
+// domain.
+//
+// It returns a cached certificate from disk if it's still valid.
+// When minValidity is non-zero, the returned certificate will be valid for at
+// least the given duration, if permitted by the CA. If the certificate is
+// valid, but for less than minValidity, it will be synchronously renewed.
+//
+// API maturity: this is considered a stable API.
+func (lc *LocalClient) CertPairWithValidity(ctx context.Context, domain string, minValidity time.Duration) (certPEM, keyPEM []byte, err error) {
+	res, err := lc.send(ctx, "GET", fmt.Sprintf("/localapi/v0/cert/%s?type=pair&min_validity=%s", domain, minValidity), 200, nil)
 	if err != nil {
 		return nil, nil, err
 	}

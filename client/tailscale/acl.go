@@ -161,7 +161,12 @@ func (c *Client) ACLHuJSON(ctx context.Context) (acl *ACLHuJSON, err error) {
 // ACLTestFailureSummary specifies the JSON format sent to the
 // JavaScript client to be rendered in the HTML.
 type ACLTestFailureSummary struct {
-	User     string   `json:"user,omitempty"`
+	// User is the source ("src") value of the ACL test that failed.
+	// The name "user" is a legacy holdover from the original naming and
+	// is kept for compatibility but it may also contain any value
+	// that's valid in a ACL test "src" field.
+	User string `json:"user,omitempty"`
+
 	Errors   []string `json:"errors,omitempty"`
 	Warnings []string `json:"warnings,omitempty"`
 }
@@ -281,6 +286,9 @@ type UserRuleMatch struct {
 	Users      []string `json:"users"`
 	Ports      []string `json:"ports"`
 	LineNumber int      `json:"lineNumber"`
+	// Via is the list of targets through which Users can access Ports.
+	// See https://tailscale.com/kb/1378/via for more information.
+	Via []string `json:"via,omitempty"`
 
 	// Postures is a list of posture policies that are
 	// associated with this match. The rules can be looked
