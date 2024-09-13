@@ -44,4 +44,8 @@ client/web/build/assets
 /gocross
 /dist
 
-.DS_Store
+# Ignore xcode userstate and workspace data
+*.xcuserstate
+*.xcworkspacedata
+/tstest/tailmac/bin
+/tstest/tailmac/build

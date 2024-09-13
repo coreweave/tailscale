@@ -353,6 +353,12 @@ func (lc *LocalClient) DaemonMetrics(ctx context.Context) ([]byte, error) {
 	return lc.get200(ctx, "/localapi/v0/metrics")
 }
 
+// UserMetrics returns the user metrics in
+// the Prometheus text exposition format.
+func (lc *LocalClient) UserMetrics(ctx context.Context) ([]byte, error) {
+	return lc.get200(ctx, "/localapi/v0/usermetrics")
+}
+
 // IncrementCounter increments the value of a Tailscale daemon's counter
 // metric by the given delta. If the metric has yet to exist, a new counter
 // metric is created and initialized to delta.
@@ -805,6 +811,18 @@ func (lc *LocalClient) EditPrefs(ctx context.Context, mp *ipn.MaskedPrefs) (*ipn
 		return nil, err
 	}
 	return decodeJSON[*ipn.Prefs](body)
+}
+
+func (lc *LocalClient) GetDNSOSConfig(ctx context.Context) (*apitype.DNSOSConfig, error) {
+	body, err := lc.get200(ctx, "/localapi/v0/dns-osconfig")
+	if err != nil {
+		return nil, err
+	}
+	var osCfg apitype.DNSOSConfig
+	if err := json.Unmarshal(body, &osCfg); err != nil {
+		return nil, fmt.Errorf("invalid dns.OSConfig: %w", err)
+	}
+	return &osCfg, nil
 }
 
 // StartLoginInteractive starts an interactive login.
