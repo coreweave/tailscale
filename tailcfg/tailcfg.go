@@ -677,6 +677,16 @@ const (
 	PeerAPIDNS = ServiceProto("peerapi-dns-proxy")
 )
 
+// IsKnownServiceProto checks whether sp represents a known-valid value of
+// ServiceProto.
+func IsKnownServiceProto(sp ServiceProto) bool {
+	switch sp {
+	case TCP, UDP, PeerAPI4, PeerAPI6, PeerAPIDNS, ServiceProto("egg"):
+		return true
+	}
+	return false
+}
+
 // Service represents a service running on a node.
 type Service struct {
 	_ structs.Incomparable
@@ -2342,6 +2352,10 @@ const (
 	// NodeAttrDisableCaptivePortalDetection instructs the client to not perform captive portal detection
 	// automatically when the network state changes.
 	NodeAttrDisableCaptivePortalDetection NodeCapability = "disable-captive-portal-detection"
+
+	// NodeAttrSSHEnvironmentVariables enables logic for handling environment variables sent
+	// via SendEnv in the SSH server and applying them to the SSH session.
+	NodeAttrSSHEnvironmentVariables NodeCapability = "ssh-env-vars"
 )
 
 // SetDNSRequest is a request to add a DNS record.
@@ -2447,6 +2461,13 @@ type SSHRule struct {
 	// Action is the outcome to task.
 	// A nil or invalid action means to deny.
 	Action *SSHAction `json:"action"`
+
+	// AcceptEnv is a slice of environment variable names that are allowlisted
+	// for the SSH rule in the policy file.
+	//
+	// AcceptEnv values may contain * and ? wildcard characters which match against
+	// an arbitrary number of characters or a single character respectively.
+	AcceptEnv []string `json:"acceptEnv,omitempty"`
 }
 
 // SSHPrincipal is either a particular node or a user on any node.

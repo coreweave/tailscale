@@ -38,6 +38,7 @@ import (
 	"go4.org/mem"
 	"go4.org/netipx"
 	xmaps "golang.org/x/exp/maps"
+	"golang.org/x/net/dns/dnsmessage"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"tailscale.com/appc"
 	"tailscale.com/client/tailscale/apitype"
@@ -118,9 +119,6 @@ import (
 	"tailscale.com/wgengine/wgcfg/nmcfg"
 )
 
-var metricAdvertisedRoutes = usermetric.NewGauge(
-	"tailscaled_advertised_routes", "Number of advertised network routes (e.g. by a subnet router)")
-
 var controlDebugFlags = getControlDebugFlags()
 
 func getControlDebugFlags() []string {
@@ -183,6 +181,7 @@ type LocalBackend struct {
 	statsLogf             logger.Logf        // for printing peers stats on change
 	sys                   *tsd.System
 	health                *health.Tracker // always non-nil
+	metrics               metrics
 	e                     wgengine.Engine // non-nil; TODO(bradfitz): remove; use sys
 	store                 ipn.StateStore  // non-nil; TODO(bradfitz): remove; use sys
 	dialer                *tsdial.Dialer  // non-nil; TODO(bradfitz): remove; use sys
@@ -192,7 +191,6 @@ type LocalBackend struct {
 	unregisterHealthWatch func()
 	portpoll              *portlist.Poller // may be nil
 	portpollOnce          sync.Once        // guards starting readPoller
-	gotPortPollRes        chan struct{}    // closed upon first readPoller result
 	varRoot               string           // or empty if SetVarRoot never called
 	logFlushFunc          func()           // or nil if SetLogFlusher wasn't called
 	em                    *expiryManager   // non-nil
@@ -376,6 +374,11 @@ func (b *LocalBackend) HealthTracker() *health.Tracker {
 	return b.health
 }
 
+// UserMetricsRegistry returns the usermetrics registry for the backend
+func (b *LocalBackend) UserMetricsRegistry() *usermetric.Registry {
+	return b.sys.UserMetricsRegistry()
+}
+
 // NetMon returns the network monitor for the backend.
 func (b *LocalBackend) NetMon() *netmon.Monitor {
 	return b.sys.NetMon.Get()
@@ -383,6 +386,21 @@ func (b *LocalBackend) NetMon() *netmon.Monitor {
 
 type updateStatus struct {
 	started bool
+}
+
+type metrics struct {
+	// advertisedRoutes is a metric that reports the number of network routes that are advertised by the local node.
+	// This informs the user of how many routes are being advertised by the local node, excluding exit routes.
+	advertisedRoutes *usermetric.Gauge
+
+	// approvedRoutes is a metric that reports the number of network routes served by the local node and approved
+	// by the control server.
+	approvedRoutes *usermetric.Gauge
+
+	// primaryRoutes is a metric that reports the number of primary network routes served by the local node.
+	// A route being a primary route implies that the route is currently served by this node, and not by another
+	// subnet router in a high availability configuration.
+	primaryRoutes *usermetric.Gauge
 }
 
 // clientGen is a func that creates a control plane client.
@@ -428,6 +446,15 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
 	captiveCtx, captiveCancel := context.WithCancel(ctx)
 	captiveCancel()
 
+	m := metrics{
+		advertisedRoutes: sys.UserMetricsRegistry().NewGauge(
+			"tailscaled_advertised_routes", "Number of advertised network routes (e.g. by a subnet router)"),
+		approvedRoutes: sys.UserMetricsRegistry().NewGauge(
+			"tailscaled_approved_routes", "Number of approved network routes (e.g. by a subnet router)"),
+		primaryRoutes: sys.UserMetricsRegistry().NewGauge(
+			"tailscaled_primary_routes", "Number of network routes for which this node is a primary router (in high availability configuration)"),
+	}
+
 	b := &LocalBackend{
 		ctx:                   ctx,
 		ctxCancel:             cancel,
@@ -436,6 +463,7 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
 		statsLogf:             logger.LogOnChange(logf, 5*time.Minute, clock.Now),
 		sys:                   sys,
 		health:                sys.HealthTracker(),
+		metrics:               m,
 		e:                     e,
 		dialer:                dialer,
 		store:                 store,
@@ -444,7 +472,6 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
 		state:                 ipn.NoState,
 		portpoll:              new(portlist.Poller),
 		em:                    newExpiryManager(logf),
-		gotPortPollRes:        make(chan struct{}),
 		loginFlags:            loginFlags,
 		clock:                 clock,
 		selfUpdateProgress:    make([]ipnstate.UpdateProgress, 0),
@@ -511,8 +538,8 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
 		currentShares := b.pm.prefs.DriveShares()
 		if currentShares.Len() > 0 {
 			var shares []*drive.Share
-			for i := range currentShares.Len() {
-				shares = append(shares, currentShares.At(i).AsStruct())
+			for _, share := range currentShares.All() {
+				shares = append(shares, share.AsStruct())
 			}
 			fs.SetShares(shares)
 		}
@@ -556,6 +583,8 @@ func (b *LocalBackend) SetComponentDebugLogging(component string, until time.Tim
 				}
 			}
 		}
+	case "syspolicy":
+		setEnabled = syspolicy.SetDebugLoggingEnabled
 	}
 	if setEnabled == nil || !slices.Contains(ipn.DebuggableComponents, component) {
 		return fmt.Errorf("unknown component %q", component)
@@ -604,6 +633,50 @@ func (b *LocalBackend) GetDNSOSConfig() (dns.OSConfig, error) {
 		return dns.OSConfig{}, errors.New("DNS manager not available")
 	}
 	return manager.GetBaseConfig()
+}
+
+// QueryDNS performs a DNS query for name and queryType using the built-in DNS resolver, and returns
+// the raw DNS response and the resolvers that are were able to handle the query (the internal forwarder
+// may race multiple resolvers).
+func (b *LocalBackend) QueryDNS(name string, queryType dnsmessage.Type) (res []byte, resolvers []*dnstype.Resolver, err error) {
+	manager, ok := b.sys.DNSManager.GetOK()
+	if !ok {
+		return nil, nil, errors.New("DNS manager not available")
+	}
+	fqdn, err := dnsname.ToFQDN(name)
+	if err != nil {
+		b.logf("DNSQuery: failed to parse FQDN %q: %v", name, err)
+		return nil, nil, err
+	}
+	n, err := dnsmessage.NewName(fqdn.WithTrailingDot())
+	if err != nil {
+		b.logf("DNSQuery: failed to parse name %q: %v", name, err)
+		return nil, nil, err
+	}
+	from := netip.MustParseAddrPort("127.0.0.1:0")
+	db := dnsmessage.NewBuilder(nil, dnsmessage.Header{
+		OpCode:           0,
+		RecursionDesired: true,
+		ID:               1,
+	})
+	db.StartQuestions()
+	db.Question(dnsmessage.Question{
+		Name:  n,
+		Type:  queryType,
+		Class: dnsmessage.ClassINET,
+	})
+	q, err := db.Finish()
+	if err != nil {
+		b.logf("DNSQuery: failed to build query: %v", err)
+		return nil, nil, err
+	}
+	res, err = manager.Query(b.ctx, q, "tcp", from)
+	if err != nil {
+		b.logf("DNSQuery: failed to query %q: %v", name, err)
+		return nil, nil, err
+	}
+	rr := manager.Resolver().GetUpstreamResolvers(fqdn)
+	return res, rr, nil
 }
 
 // GetComponentDebugLogging gets the time that component's debug logging is
@@ -1985,20 +2058,6 @@ func (b *LocalBackend) Start(opts ipn.Options) error {
 	if b.portpoll != nil {
 		b.portpollOnce.Do(func() {
 			go b.readPoller()
-
-			// Give the poller a second to get results to
-			// prevent it from restarting our map poll
-			// HTTP request (via doSetHostinfoFilterServices >
-			// cli.SetHostinfo). In practice this is very quick.
-			t0 := b.clock.Now()
-			timer, timerChannel := b.clock.NewTimer(time.Second)
-			select {
-			case <-b.gotPortPollRes:
-				b.logf("[v1] got initial portlist info in %v", b.clock.Since(t0).Round(time.Millisecond))
-				timer.Stop()
-			case <-timerChannel:
-				b.logf("timeout waiting for initial portlist")
-			}
 		})
 	}
 
@@ -2514,21 +2573,21 @@ func shrinkDefaultRoute(route netip.Prefix, localInterfaceRoutes *netipx.IPSet, 
 // readPoller is a goroutine that receives service lists from
 // b.portpoll and propagates them into the controlclient's HostInfo.
 func (b *LocalBackend) readPoller() {
-	isFirst := true
+	if !envknob.BoolDefaultTrue("TS_PORTLIST") {
+		return
+	}
+
 	ticker, tickerChannel := b.clock.NewTicker(portlist.PollInterval())
 	defer ticker.Stop()
-	initChan := make(chan struct{})
-	close(initChan)
 	for {
 		select {
 		case <-tickerChannel:
 		case <-b.ctx.Done():
 			return
-		case <-initChan:
-			// Preserving old behavior: readPoller should
-			// immediately poll the first time, then wait
-			// for a tick after.
-			initChan = nil
+		}
+
+		if !b.shouldUploadServices() {
+			continue
 		}
 
 		ports, changed, err := b.portpoll.Poll()
@@ -2559,11 +2618,6 @@ func (b *LocalBackend) readPoller() {
 		b.mu.Unlock()
 
 		b.doSetHostinfoFilterServices()
-
-		if isFirst {
-			isFirst = false
-			close(b.gotPortPollRes)
-		}
 	}
 }
 
@@ -4538,11 +4592,6 @@ func magicDNSRootDomains(nm *netmap.NetworkMap) []dnsname.FQDN {
 	return nil
 }
 
-var (
-	ipv4Default = netip.MustParsePrefix("0.0.0.0/0")
-	ipv6Default = netip.MustParsePrefix("::/0")
-)
-
 // peerRoutes returns the routerConfig.Routes to access peers.
 // If there are over cgnatThreshold CGNAT routes, one big CGNAT route
 // is used instead.
@@ -4643,9 +4692,9 @@ func (b *LocalBackend) routerConfig(cfg *wgcfg.Config, prefs ipn.PrefsView, oneC
 		var default4, default6 bool
 		for _, route := range rs.Routes {
 			switch route {
-			case ipv4Default:
+			case tsaddr.AllIPv4():
 				default4 = true
-			case ipv6Default:
+			case tsaddr.AllIPv6():
 				default6 = true
 			}
 			if default4 && default6 {
@@ -4653,10 +4702,10 @@ func (b *LocalBackend) routerConfig(cfg *wgcfg.Config, prefs ipn.PrefsView, oneC
 			}
 		}
 		if !default4 {
-			rs.Routes = append(rs.Routes, ipv4Default)
+			rs.Routes = append(rs.Routes, tsaddr.AllIPv4())
 		}
 		if !default6 {
-			rs.Routes = append(rs.Routes, ipv6Default)
+			rs.Routes = append(rs.Routes, tsaddr.AllIPv6())
 		}
 		internalIPs, externalIPs, err := internalAndExternalInterfaces()
 		if err != nil {
@@ -4713,14 +4762,7 @@ func (b *LocalBackend) applyPrefsToHostinfoLocked(hi *tailcfg.Hostinfo, prefs ip
 	hi.ShieldsUp = prefs.ShieldsUp()
 	hi.AllowsUpdate = envknob.AllowsRemoteUpdate() || prefs.AutoUpdate().Apply.EqualBool(true)
 
-	// count routes without exit node routes
-	var routes int64
-	for _, route := range hi.RoutableIPs {
-		if route.Bits() != 0 {
-			routes++
-		}
-	}
-	metricAdvertisedRoutes.Set(float64(routes))
+	b.metrics.advertisedRoutes.Set(float64(tsaddr.WithoutExitRoute(prefs.AdvertiseRoutes()).Len()))
 
 	var sshHostKeys []string
 	if prefs.RunSSH() && envknob.CanSSHD() {
@@ -5345,6 +5387,11 @@ func (b *LocalBackend) setNetMapLocked(nm *netmap.NetworkMap) {
 	b.setTCPPortsInterceptedFromNetmapAndPrefsLocked(b.pm.CurrentPrefs())
 	if nm == nil {
 		b.nodeByAddr = nil
+
+		// If there is no netmap, the client is going into a "turned off"
+		// state so reset the metrics.
+		b.metrics.approvedRoutes.Set(0)
+		b.metrics.primaryRoutes.Set(0)
 		return
 	}
 
@@ -5365,6 +5412,15 @@ func (b *LocalBackend) setNetMapLocked(nm *netmap.NetworkMap) {
 	}
 	if nm.SelfNode.Valid() {
 		addNode(nm.SelfNode)
+
+		var approved float64
+		for _, route := range nm.SelfNode.AllowedIPs().All() {
+			if !views.SliceContains(nm.SelfNode.Addresses(), route) && !tsaddr.IsExitRoute(route) {
+				approved++
+			}
+		}
+		b.metrics.approvedRoutes.Set(approved)
+		b.metrics.primaryRoutes.Set(float64(tsaddr.WithoutExitRoute(nm.SelfNode.PrimaryRoutes()).Len()))
 	}
 	for _, p := range nm.Peers {
 		addNode(p)
@@ -6189,8 +6245,8 @@ func wireguardExitNodeDNSResolvers(nm *netmap.NetworkMap, peers map[tailcfg.Node
 				resolvers := p.ExitNodeDNSResolvers()
 				if !resolvers.IsNil() && resolvers.Len() > 0 {
 					copies := make([]*dnstype.Resolver, resolvers.Len())
-					for i := range resolvers.Len() {
-						copies[i] = resolvers.At(i).AsStruct()
+					for i, r := range resolvers.All() {
+						copies[i] = r.AsStruct()
 					}
 					return copies, true
 				}
