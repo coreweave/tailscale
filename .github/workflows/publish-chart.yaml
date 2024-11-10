@@ -55,6 +55,7 @@ jobs:
         shell: bash
         if: ${{ always() && format('refs/heads/{0}', github.event.repository.default_branch) == github.ref }}
         run: |
+          go run cmd/k8s-operator/generate/main.go helmcrd
           helm package cmd/k8s-operator/deploy/chart --dependency-update --version ${{ env.HELM_VERSION }} --app-version ${{ env.HELM_VERSION }}
           pkg=$(ls tailscale-operator-*.tgz)
           helm push "${pkg}" oci://ghcr.io/${{ github.repository }}/chart
