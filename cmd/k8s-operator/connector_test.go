@@ -297,6 +297,14 @@ func TestConnectorWithProxyClass(t *testing.T) {
 	opts.proxyClass = ""
 	expectReconciled(t, cr, "", "test")
 	expectEqual(t, fc, expectedSTS(t, fc, opts), removeHashAnnotation)
+
+	// 5. defaultProxyClass is set by the operator, Connector gets
+	// reconciled and configuration from the defaultProxyClass is applied to
+	// its resources.
+	cr.defaultProxyClass = pc.Name
+	opts.proxyClass = pc.Name
+	expectReconciled(t, cr, "", "test")
+	expectEqual(t, fc, expectedSTS(t, fc, opts), removeHashAnnotation)
 }
 
 func TestConnectorWithAppConnector(t *testing.T) {

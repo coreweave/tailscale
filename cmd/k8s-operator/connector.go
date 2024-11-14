@@ -60,6 +60,8 @@ type ConnectorReconciler struct {
 	subnetRouters set.Slice[types.UID] // for subnet routers gauge
 	exitNodes     set.Slice[types.UID] // for exit nodes gauge
 	appConnectors set.Slice[types.UID] // for app connectors gauge
+
+	defaultProxyClass string
 }
 
 var (
@@ -160,6 +162,15 @@ func (a *ConnectorReconciler) Reconcile(ctx context.Context, req reconcile.Reque
 	return setStatus(cn, tsapi.ConnectorReady, metav1.ConditionTrue, reasonConnectorCreated, reasonConnectorCreated)
 }
 
+// proxyClassForConnector returns the ProxyClass to use for the given Connector.
+// If the connector does not specify a ProxyClass, the default class is returned.
+func proxyClassForConnector(cn *tsapi.Connector, defaultProxyClass string) string {
+	if cn.Spec.ProxyClass != "" {
+		return string(cn.Spec.ProxyClass)
+	}
+	return defaultProxyClass
+}
+
 // maybeProvisionConnector ensures that any new resources required for this
 // Connector instance are deployed to the cluster.
 func (a *ConnectorReconciler) maybeProvisionConnector(ctx context.Context, logger *zap.SugaredLogger, cn *tsapi.Connector) error {
@@ -169,7 +180,7 @@ func (a *ConnectorReconciler) maybeProvisionConnector(ctx context.Context, logge
 	}
 	crl := childResourceLabels(cn.Name, a.tsnamespace, "connector")
 
-	proxyClass := cn.Spec.ProxyClass
+	proxyClass := proxyClassForConnector(cn, a.defaultProxyClass)
 	if proxyClass != "" {
 		if ready, err := proxyClassIsReady(ctx, proxyClass, a.Client); err != nil {
 			return fmt.Errorf("error verifying ProxyClass for Connector: %w", err)
