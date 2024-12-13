@@ -8,9 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"net/netip"
-	"os"
 	"slices"
-	"strings"
 	"sync"
 
 	"go4.org/netipx"
@@ -18,28 +16,15 @@ import (
 	"tailscale.com/types/views"
 )
 
-// CGNatOverrideRange returns the subset of CGNAT IPv$ range that
-// is passed via env to RETURN traffic over the 100.64.0.0/10 DROP.
-// Additionally, it returns the CGNAT IPv4 range used by ChromeOS
-// to host containers and VMs.
-// We avoid allocating Tailscale IPs from it, to avoid conflicts.
-func CGNatOverrideRange() []netip.Prefix {
-	var CGNatOverrideRange []string
-	chromeOSRange := "100.115.92.0/23"
-	envRange := os.Getenv("TS_CGNAT_OVERRIDE_RANGE")
-	if envRange != "" {
-		CGNatOverrideRange = append(CGNatOverrideRange, strings.Split(envRange, ",")...)
-	}
-	CGNatOverrideRange = append(CGNatOverrideRange, chromeOSRange)
-
-	cgNatOverrideRange.Do(func() {
-		for _, cidr := range CGNatOverrideRange {
-			mustPrefixSlice(&cgNatOverrideRange.v, strings.TrimSpace(cidr))
-		}
-	})
-
-	return cgNatOverrideRange.v
+// ChromeOSVMRange returns the subset of the CGNAT IPv4 range used by
+// ChromeOS to interconnect the host OS to containers and VMs. We
+// avoid allocating Tailscale IPs from it, to avoid conflicts.
+func ChromeOSVMRange() netip.Prefix {
+	chromeOSRange.Do(func() { mustPrefix(&chromeOSRange.v, "100.115.92.0/23") })
+	return chromeOSRange.v
 }
+
+var chromeOSRange oncePrefix
 
 // CGNATRange returns the Carrier Grade NAT address range that
 // is the superset range that Tailscale assigns out of.
@@ -51,13 +36,12 @@ func CGNATRange() netip.Prefix {
 }
 
 var (
-	cgnatRange         oncePrefix
-	tsUlaRange         oncePrefix
-	tsViaRange         oncePrefix
-	ula4To6Range       oncePrefix
-	ulaEph6Range       oncePrefix
-	serviceIPv6        oncePrefix
-	cgNatOverrideRange oncePrefixSlice
+	cgnatRange   oncePrefix
+	tsUlaRange   oncePrefix
+	tsViaRange   oncePrefix
+	ula4To6Range oncePrefix
+	ulaEph6Range oncePrefix
+	serviceIPv6  oncePrefix
 )
 
 // TailscaleServiceIP returns the IPv4 listen address of services
@@ -82,13 +66,19 @@ const (
 	TailscaleServiceIPv6String = "fd7a:115c:a1e0::53"
 )
 
-// IsTailscaleIP reports whether ip is an IP address in a range that
+// IsTailscaleIP reports whether IP is an IP address in a range that
 // Tailscale assigns from.
 func IsTailscaleIP(ip netip.Addr) bool {
 	if ip.Is4() {
-		return CGNATRange().Contains(ip) && !PrefixesContainsIP(CGNatOverrideRange(), ip)
+		return IsTailscaleIPv4(ip)
 	}
 	return TailscaleULARange().Contains(ip)
+}
+
+// IsTailscaleIPv4 reports whether an IPv4 IP is an IP address that
+// Tailscale assigns from.
+func IsTailscaleIPv4(ip netip.Addr) bool {
+	return CGNATRange().Contains(ip) && !ChromeOSVMRange().Contains(ip)
 }
 
 // TailscaleULARange returns the IPv6 Unique Local Address range that
@@ -171,22 +161,9 @@ func mustPrefix(v *netip.Prefix, prefix string) {
 	}
 }
 
-func mustPrefixSlice(prefixes *[]netip.Prefix, cidr string) {
-	prefix, err := netip.ParsePrefix(cidr)
-	if err != nil {
-		panic(err)
-	}
-	*prefixes = append(*prefixes, prefix)
-}
-
 type oncePrefix struct {
 	sync.Once
 	v netip.Prefix
-}
-
-type oncePrefixSlice struct {
-	sync.Once
-	v []netip.Prefix
 }
 
 // PrefixesContainsIP reports whether any prefix in ipp contains ip.
@@ -209,8 +186,7 @@ func PrefixIs6(p netip.Prefix) bool { return p.Addr().Is6() }
 // IPv6 /0 route.
 func ContainsExitRoutes(rr views.Slice[netip.Prefix]) bool {
 	var v4, v6 bool
-	for i := range rr.Len() {
-		r := rr.At(i)
+	for _, r := range rr.All() {
 		if r == allIPv4 {
 			v4 = true
 		} else if r == allIPv6 {
@@ -223,8 +199,8 @@ func ContainsExitRoutes(rr views.Slice[netip.Prefix]) bool {
 // ContainsExitRoute reports whether rr contains at least one of IPv4 or
 // IPv6 /0 (exit) routes.
 func ContainsExitRoute(rr views.Slice[netip.Prefix]) bool {
-	for i := range rr.Len() {
-		if rr.At(i).Bits() == 0 {
+	for _, r := range rr.All() {
+		if r.Bits() == 0 {
 			return true
 		}
 	}
@@ -234,8 +210,8 @@ func ContainsExitRoute(rr views.Slice[netip.Prefix]) bool {
 // ContainsNonExitSubnetRoutes reports whether v contains Subnet
 // Routes other than ExitNode Routes.
 func ContainsNonExitSubnetRoutes(rr views.Slice[netip.Prefix]) bool {
-	for i := range rr.Len() {
-		if rr.At(i).Bits() != 0 {
+	for _, r := range rr.All() {
+		if r.Bits() != 0 {
 			return true
 		}
 	}
