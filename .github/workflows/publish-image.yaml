@@ -57,7 +57,7 @@ jobs:
       - name: Publish k8s-operator
         shell: bash
         run: |
-          REPOS="ghcr.io/${{ github.repository }}/k8s-operator" TARGET="operator" ./build_docker.sh
+          REPOS="ghcr.io/${{ github.repository }}/k8s-operator" TARGET="k8s-operator" ./build_docker.sh
 
       - name: Publish k8s-nameserver
         shell: bash
