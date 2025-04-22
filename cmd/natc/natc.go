@@ -27,9 +27,7 @@ import (
 	"github.com/inetaf/tcpproxy"
 	"github.com/peterbourgon/ff/v3"
 	"golang.org/x/net/dns/dnsmessage"
-	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
-	"tailscale.com/client/tailscale"
+	"tailscale.com/client/local"
 	"tailscale.com/envknob"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
@@ -42,6 +40,8 @@ import (
 	"tailscale.com/util/mak"
 	"tailscale.com/wgengine/netstack"
 )
+
+var ErrNoIPsAvailable = errors.New("no IPs available")
 
 func main() {
 	hostinfo.SetApp("natc")
@@ -94,18 +94,24 @@ func main() {
 		}
 		ignoreDstTable.Insert(pfx, true)
 	}
-	var v4Prefixes []netip.Prefix
+	var (
+		v4Prefixes    []netip.Prefix
+		numV4DNSAddrs int
+	)
 	for _, s := range strings.Split(*v4PfxStr, ",") {
 		p := netip.MustParsePrefix(strings.TrimSpace(s))
 		if p.Masked() != p {
 			log.Fatalf("v4 prefix %v is not a masked prefix", p)
 		}
 		v4Prefixes = append(v4Prefixes, p)
+		numIPs := 1 << (32 - p.Bits())
+		numV4DNSAddrs += numIPs
 	}
 	if len(v4Prefixes) == 0 {
 		log.Fatalf("no v4 prefixes specified")
 	}
 	dnsAddr := v4Prefixes[0].Addr()
+	numV4DNSAddrs -= 1 // Subtract the dnsAddr allocated above.
 	ts := &tsnet.Server{
 		Hostname: *hostname,
 	}
@@ -140,26 +146,6 @@ func main() {
 	}
 	// TODO(raggi): this is not a public interface or guarantee.
 	ns := ts.Sys().Netstack.Get().(*netstack.Impl)
-	tcpRXBufOpt := tcpip.TCPReceiveBufferSizeRangeOption{
-		Min:     tcp.MinBufferSize,
-		Default: tcp.DefaultReceiveBufferSize,
-		Max:     tcp.MaxBufferSize,
-	}
-	if err := ns.SetTransportProtocolOption(tcp.ProtocolNumber, &tcpRXBufOpt); err != nil {
-		log.Fatalf("could not set TCP RX buf size: %v", err)
-	}
-	tcpTXBufOpt := tcpip.TCPSendBufferSizeRangeOption{
-		Min:     tcp.MinBufferSize,
-		Default: tcp.DefaultSendBufferSize,
-		Max:     tcp.MaxBufferSize,
-	}
-	if err := ns.SetTransportProtocolOption(tcp.ProtocolNumber, &tcpTXBufOpt); err != nil {
-		log.Fatalf("could not set TCP TX buf size: %v", err)
-	}
-	mslOpt := tcpip.TCPTimeWaitTimeoutOption(5 * time.Second)
-	if err := ns.SetTransportProtocolOption(tcp.ProtocolNumber, &mslOpt); err != nil {
-		log.Fatalf("could not set TCP MSL: %v", err)
-	}
 	if *debugPort != 0 {
 		expvar.Publish("netstack", ns.ExpVar())
 	}
@@ -173,12 +159,13 @@ func main() {
 	}
 
 	c := &connector{
-		ts:         ts,
-		lc:         lc,
-		dnsAddr:    dnsAddr,
-		v4Ranges:   v4Prefixes,
-		v6ULA:      ula(uint16(*siteID)),
-		ignoreDsts: ignoreDstTable,
+		ts:            ts,
+		lc:            lc,
+		dnsAddr:       dnsAddr,
+		v4Ranges:      v4Prefixes,
+		numV4DNSAddrs: numV4DNSAddrs,
+		v6ULA:         ula(uint16(*siteID)),
+		ignoreDsts:    ignoreDstTable,
 	}
 	c.run(ctx)
 }
@@ -186,9 +173,9 @@ func main() {
 type connector struct {
 	// ts is the tsnet.Server used to host the connector.
 	ts *tsnet.Server
-	// lc is the LocalClient used to interact with the tsnet.Server hosting this
+	// lc is the local.Client used to interact with the tsnet.Server hosting this
 	// connector.
-	lc *tailscale.LocalClient
+	lc *local.Client
 
 	// dnsAddr is the IPv4 address to listen on for DNS requests. It is used to
 	// prevent the app connector from assigning it to a domain.
@@ -197,6 +184,11 @@ type connector struct {
 	// v4Ranges is the list of IPv4 ranges to advertise and assign addresses from.
 	// These are masked prefixes.
 	v4Ranges []netip.Prefix
+
+	// numV4DNSAddrs is the total size of the IPv4 ranges in addresses, minus the
+	// dnsAddr allocation.
+	numV4DNSAddrs int
+
 	// v6ULA is the ULA prefix used by the app connector to assign IPv6 addresses.
 	v6ULA netip.Prefix
 
@@ -299,14 +291,14 @@ func (c *connector) handleDNS(pc net.PacketConn, buf []byte, remoteAddr *net.UDP
 	defer cancel()
 	who, err := c.lc.WhoIs(ctx, remoteAddr.String())
 	if err != nil {
-		log.Printf("HandleDNS: WhoIs failed: %v\n", err)
+		log.Printf("HandleDNS(remote=%s): WhoIs failed: %v\n", remoteAddr.String(), err)
 		return
 	}
 
 	var msg dnsmessage.Message
 	err = msg.Unpack(buf)
 	if err != nil {
-		log.Printf("HandleDNS: dnsmessage unpack failed: %v\n ", err)
+		log.Printf("HandleDNS(remote=%s): dnsmessage unpack failed: %v\n", remoteAddr.String(), err)
 		return
 	}
 
@@ -319,19 +311,19 @@ func (c *connector) handleDNS(pc net.PacketConn, buf []byte, remoteAddr *net.UDP
 			case dnsmessage.TypeAAAA, dnsmessage.TypeA:
 				dstAddrs, err := lookupDestinationIP(q.Name.String())
 				if err != nil {
-					log.Printf("HandleDNS: lookup destination failed: %v\n ", err)
+					log.Printf("HandleDNS(remote=%s): lookup destination failed: %v\n", remoteAddr.String(), err)
 					return
 				}
 				if c.ignoreDestination(dstAddrs) {
 					bs, err := dnsResponse(&msg, dstAddrs)
 					// TODO (fran): treat as SERVFAIL
 					if err != nil {
-						log.Printf("HandleDNS: generate ignore response failed: %v\n", err)
+						log.Printf("HandleDNS(remote=%s): generate ignore response failed: %v\n", remoteAddr.String(), err)
 						return
 					}
 					_, err = pc.WriteTo(bs, remoteAddr)
 					if err != nil {
-						log.Printf("HandleDNS: write failed: %v\n", err)
+						log.Printf("HandleDNS(remote=%s): write failed: %v\n", remoteAddr.String(), err)
 					}
 					return
 				}
@@ -344,7 +336,7 @@ func (c *connector) handleDNS(pc net.PacketConn, buf []byte, remoteAddr *net.UDP
 	resp, err := c.generateDNSResponse(&msg, who.Node.ID)
 	// TODO (fran): treat as SERVFAIL
 	if err != nil {
-		log.Printf("HandleDNS: connector handling failed: %v\n", err)
+		log.Printf("HandleDNS(remote=%s): connector handling failed: %v\n", remoteAddr.String(), err)
 		return
 	}
 	// TODO (fran): treat as NXDOMAIN
@@ -354,7 +346,7 @@ func (c *connector) handleDNS(pc net.PacketConn, buf []byte, remoteAddr *net.UDP
 	// This connector handled the DNS request
 	_, err = pc.WriteTo(resp, remoteAddr)
 	if err != nil {
-		log.Printf("HandleDNS: write failed: %v\n", err)
+		log.Printf("HandleDNS(remote=%s): write failed: %v\n", remoteAddr.String(), err)
 	}
 }
 
@@ -522,6 +514,7 @@ type perPeerState struct {
 	mu           sync.Mutex
 	domainToAddr map[string][]netip.Addr
 	addrToDomain *bart.Table[string]
+	numV4Allocs  int
 }
 
 // domainForIP returns the domain name assigned to the given IP address and
@@ -551,6 +544,9 @@ func (ps *perPeerState) ipForDomain(domain string) ([]netip.Addr, error) {
 		return addrs, nil
 	}
 	addrs := ps.assignAddrsLocked(domain)
+	if addrs == nil {
+		return nil, ErrNoIPsAvailable
+	}
 	return addrs, nil
 }
 
@@ -564,17 +560,25 @@ func (ps *perPeerState) isIPUsedLocked(ip netip.Addr) bool {
 
 // unusedIPv4Locked returns an unused IPv4 address from the available ranges.
 func (ps *perPeerState) unusedIPv4Locked() netip.Addr {
+	// All addresses have been allocated.
+	if ps.numV4Allocs >= ps.c.numV4DNSAddrs {
+		return netip.Addr{}
+	}
+
 	// TODO: skip ranges that have been exhausted
-	for _, r := range ps.c.v4Ranges {
-		ip := randV4(r)
-		for r.Contains(ip) {
+	// TODO: implement a much more efficient algorithm for finding unused IPs,
+	// this is fairly crazy.
+	for {
+		for _, r := range ps.c.v4Ranges {
+			ip := randV4(r)
+			if !r.Contains(ip) {
+				panic("error: randV4 returned invalid address")
+			}
 			if !ps.isIPUsedLocked(ip) && ip != ps.c.dnsAddr {
 				return ip
 			}
-			ip = ip.Next()
 		}
 	}
-	return netip.Addr{}
 }
 
 // randV4 returns a random IPv4 address within the given prefix.
@@ -597,6 +601,10 @@ func (ps *perPeerState) assignAddrsLocked(domain string) []netip.Addr {
 		ps.addrToDomain = &bart.Table[string]{}
 	}
 	v4 := ps.unusedIPv4Locked()
+	if !v4.IsValid() {
+		return nil
+	}
+	ps.numV4Allocs++
 	as16 := ps.c.v6ULA.Addr().As16()
 	as4 := v4.As4()
 	copy(as16[12:], as4[:])
