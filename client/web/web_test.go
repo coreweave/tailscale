@@ -22,7 +22,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/gorilla/csrf"
-	"tailscale.com/client/tailscale"
+	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
@@ -122,7 +122,7 @@ func TestServeAPI(t *testing.T) {
 
 	s := &Server{
 		mode:    ManageServerMode,
-		lc:      &tailscale.LocalClient{Dial: lal.Dial},
+		lc:      &local.Client{Dial: lal.Dial},
 		timeNow: time.Now,
 	}
 
@@ -290,7 +290,7 @@ func TestGetTailscaleBrowserSession(t *testing.T) {
 
 	s := &Server{
 		timeNow: time.Now,
-		lc:      &tailscale.LocalClient{Dial: lal.Dial},
+		lc:      &local.Client{Dial: lal.Dial},
 	}
 
 	// Add some browser sessions to cache state.
@@ -459,7 +459,7 @@ func TestAuthorizeRequest(t *testing.T) {
 
 	s := &Server{
 		mode:    ManageServerMode,
-		lc:      &tailscale.LocalClient{Dial: lal.Dial},
+		lc:      &local.Client{Dial: lal.Dial},
 		timeNow: time.Now,
 	}
 	validCookie := "ts-cookie"
@@ -574,7 +574,7 @@ func TestServeAuth(t *testing.T) {
 
 	s := &Server{
 		mode:        ManageServerMode,
-		lc:          &tailscale.LocalClient{Dial: lal.Dial},
+		lc:          &local.Client{Dial: lal.Dial},
 		timeNow:     func() time.Time { return timeNow },
 		newAuthURL:  mockNewAuthURL,
 		waitAuthURL: mockWaitAuthURL,
@@ -916,7 +916,7 @@ func TestServeAPIAuthMetricLogging(t *testing.T) {
 
 	s := &Server{
 		mode:        ManageServerMode,
-		lc:          &tailscale.LocalClient{Dial: lal.Dial},
+		lc:          &local.Client{Dial: lal.Dial},
 		timeNow:     func() time.Time { return timeNow },
 		newAuthURL:  mockNewAuthURL,
 		waitAuthURL: mockWaitAuthURL,
@@ -1128,7 +1128,7 @@ func TestRequireTailscaleIP(t *testing.T) {
 
 	s := &Server{
 		mode:    ManageServerMode,
-		lc:      &tailscale.LocalClient{Dial: lal.Dial},
+		lc:      &local.Client{Dial: lal.Dial},
 		timeNow: time.Now,
 		logf:    t.Logf,
 	}
@@ -1175,6 +1175,16 @@ func TestRequireTailscaleIP(t *testing.T) {
 		{
 			name:        "ipv6-service-addr",
 			target:      "http://[fd7a:115c:a1e0::53]/",
+			wantHandled: false,
+		},
+		{
+			name:        "quad-100:80",
+			target:      "http://100.100.100.100:80/",
+			wantHandled: false,
+		},
+		{
+			name:        "ipv6-service-addr:80",
+			target:      "http://[fd7a:115c:a1e0::53]:80/",
 			wantHandled: false,
 		},
 	}
