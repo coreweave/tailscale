@@ -600,7 +600,7 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `type` _[ProxyGroupType](#proxygrouptype)_ | Type of the ProxyGroup proxies. Currently the only supported type is egress.<br />Type is immutable once a ProxyGroup is created. |  | Enum: [egress ingress] <br />Type: string <br /> |
+| `type` _[ProxyGroupType](#proxygrouptype)_ | Type of the ProxyGroup proxies. Supported types are egress and ingress.<br />Type is immutable once a ProxyGroup is created. |  | Enum: [egress ingress] <br />Type: string <br /> |
 | `tags` _[Tags](#tags)_ | Tags that the Tailscale devices will be tagged with. Defaults to [tag:k8s].<br />If you specify custom tags here, make sure you also make the operator<br />an owner of these tags.<br />See  https://tailscale.com/kb/1236/kubernetes-operator/#setting-up-the-kubernetes-operator.<br />Tags cannot be changed once a ProxyGroup device has been created.<br />Tag values must be in form ^tag:[a-zA-Z][a-zA-Z0-9-]*$. |  | Pattern: `^tag:[a-zA-Z][a-zA-Z0-9-]*$` <br />Type: string <br /> |
 | `replicas` _integer_ | Replicas specifies how many replicas to create the StatefulSet with.<br />Defaults to 2. |  | Minimum: 0 <br /> |
 | `hostnamePrefix` _[HostnamePrefix](#hostnameprefix)_ | HostnamePrefix is the hostname prefix to use for tailnet devices created<br />by the ProxyGroup. Each device will have the integer number from its<br />StatefulSet pod appended to this prefix to form the full hostname.<br />HostnamePrefix can contain lower case letters, numbers and dashes, it<br />must not start with a dash and must be between 1 and 62 characters long. |  | Pattern: `^[a-z0-9][a-z0-9-]{0,61}$` <br />Type: string <br /> |
@@ -726,6 +726,24 @@ _Appears in:_
 | `imagePullSecrets` _[LocalObjectReference](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.3/#localobjectreference-v1-core) array_ | Image pull Secrets for Recorder Pods.<br />https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#PodSpec |  |  |
 | `nodeSelector` _object (keys:string, values:string)_ | Node selector rules for Recorder Pods. By default, the operator does<br />not apply any node selector rules.<br />https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#scheduling |  |  |
 | `tolerations` _[Toleration](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.3/#toleration-v1-core) array_ | Tolerations for Recorder Pods. By default, the operator does not apply<br />any tolerations.<br />https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#scheduling |  |  |
+| `serviceAccount` _[RecorderServiceAccount](#recorderserviceaccount)_ | Config for the ServiceAccount to create for the Recorder's StatefulSet.<br />By default, the operator will create a ServiceAccount with the same<br />name as the Recorder resource.<br />https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#service-account |  |  |
+
+
+#### RecorderServiceAccount
+
+
+
+
+
+
+
+_Appears in:_
+- [RecorderPod](#recorderpod)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `name` _string_ | Name of the ServiceAccount to create. Defaults to the name of the<br />Recorder resource.<br />https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#service-account |  | MaxLength: 253 <br />Pattern: `^[a-z0-9]([a-z0-9-.]{0,61}[a-z0-9])?$` <br />Type: string <br /> |
+| `annotations` _object (keys:string, values:string)_ | Annotations to add to the ServiceAccount.<br />https://kubernetes.io/docs/concepts/overview/working-with-objects/annotations/#syntax-and-character-set<br />You can use this to add IAM roles to the ServiceAccount (IRSA) instead of<br />providing static S3 credentials in a Secret.<br />https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts.html<br />For example:<br />eks.amazonaws.com/role-arn: arn:aws:iam::<account-id>:role/<role-name> |  |  |
 
 
 #### RecorderSpec

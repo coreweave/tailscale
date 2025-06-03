@@ -30,11 +30,13 @@ import (
 
 	"go4.org/mem"
 	"tailscale.com/derp"
+	"tailscale.com/derp/derpconst"
 	"tailscale.com/envknob"
 	"tailscale.com/health"
 	"tailscale.com/net/dnscache"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/netns"
+	"tailscale.com/net/netx"
 	"tailscale.com/net/sockstats"
 	"tailscale.com/net/tlsdial"
 	"tailscale.com/net/tshttpproxy"
@@ -587,7 +589,7 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
 //
 // The primary use for this is the derper mesh mode to connect to each
 // other over a VPC network.
-func (c *Client) SetURLDialer(dialer func(ctx context.Context, network, addr string) (net.Conn, error)) {
+func (c *Client) SetURLDialer(dialer netx.DialFunc) {
 	c.dialer = dialer
 }
 
@@ -1151,7 +1153,7 @@ var ErrClientClosed = errors.New("derphttp.Client closed")
 func parseMetaCert(certs []*x509.Certificate) (serverPub key.NodePublic, serverProtoVersion int) {
 	for _, cert := range certs {
 		// Look for derpkey prefix added by initMetacert() on the server side.
-		if pubHex, ok := strings.CutPrefix(cert.Subject.CommonName, "derpkey"); ok {
+		if pubHex, ok := strings.CutPrefix(cert.Subject.CommonName, derpconst.MetaCertCommonNamePrefix); ok {
 			var err error
 			serverPub, err = key.ParseNodePublicUntyped(mem.S(pubHex))
 			if err == nil && cert.SerialNumber.BitLen() <= 8 { // supports up to version 255
