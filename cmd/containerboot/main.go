@@ -195,18 +195,21 @@ func run() error {
 		return fmt.Errorf("failed to bring up tailscale: %w", err)
 	}
 	killTailscaled := func() {
+		// The default termination grace period for a Pod is 30s. We wait 25s at
+		// most so that we still reserve some of that budget for tailscaled
+		// to receive and react to a SIGTERM before the SIGKILL that k8s
+		// will send at the end of the grace period.
+		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+		defer cancel()
+
+		if err := ensureServicesNotAdvertised(ctx, client); err != nil {
+			log.Printf("Error ensuring services are not advertised: %v", err)
+		}
+
 		if hasKubeStateStore(cfg) {
 			// Check we're not shutting tailscaled down while it's still writing
 			// state. If we authenticate and fail to write all the state, we'll
 			// never recover automatically.
-			//
-			// The default termination grace period for a Pod is 30s. We wait 25s at
-			// most so that we still reserve some of that budget for tailscaled
-			// to receive and react to a SIGTERM before the SIGKILL that k8s
-			// will send at the end of the grace period.
-			ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
-			defer cancel()
-
 			log.Printf("Checking for consistent state")
 			err := kc.waitForConsistentState(ctx)
 			if err != nil {
@@ -226,7 +229,7 @@ func run() error {
 		mux := http.NewServeMux()
 
 		log.Printf("Running healthcheck endpoint at %s/healthz", cfg.HealthCheckAddrPort)
-		healthCheck = healthHandlers(mux, cfg.PodIPv4)
+		healthCheck = registerHealthHandlers(mux, cfg.PodIPv4)
 
 		close := runHTTPServer(mux, cfg.HealthCheckAddrPort)
 		defer close()
@@ -237,15 +240,16 @@ func run() error {
 
 		if cfg.localMetricsEnabled() {
 			log.Printf("Running metrics endpoint at %s/metrics", cfg.LocalAddrPort)
-			metricsHandlers(mux, client, cfg.DebugAddrPort)
+			registerMetricsHandlers(mux, client, cfg.DebugAddrPort)
 		}
 
 		if cfg.localHealthEnabled() {
 			log.Printf("Running healthcheck endpoint at %s/healthz", cfg.LocalAddrPort)
-			healthCheck = healthHandlers(mux, cfg.PodIPv4)
+			healthCheck = registerHealthHandlers(mux, cfg.PodIPv4)
 		}
-		if cfg.EgressProxiesCfgPath != "" {
-			log.Printf("Running preshutdown hook at %s%s", cfg.LocalAddrPort, kubetypes.EgessServicesPreshutdownEP)
+
+		if cfg.egressSvcsTerminateEPEnabled() {
+			log.Printf("Running egress preshutdown hook at %s%s", cfg.LocalAddrPort, kubetypes.EgessServicesPreshutdownEP)
 			ep.registerHandlers(mux)
 		}
 
@@ -437,6 +441,7 @@ authLoop:
 	// egressSvcsErrorChan will get an error sent to it if this containerboot instance is configured to expose 1+
 	// egress services in HA mode and errored.
 	var egressSvcsErrorChan = make(chan error)
+	var ingressSvcsErrorChan = make(chan error)
 	defer t.Stop()
 	// resetTimer resets timer for when to next attempt to resolve the DNS
 	// name for the proxy configured with TS_EXPERIMENTAL_DEST_DNS_NAME. The
@@ -690,6 +695,23 @@ runLoop:
 							}
 						}()
 					}
+					ip := ingressProxy{}
+					if cfg.IngressProxiesCfgPath != "" {
+						log.Printf("configuring ingress proxy using configuration file at %s", cfg.IngressProxiesCfgPath)
+						opts := ingressProxyOpts{
+							cfgPath:     cfg.IngressProxiesCfgPath,
+							nfr:         nfr,
+							kc:          kc,
+							stateSecret: cfg.KubeSecret,
+							podIPv4:     cfg.PodIPv4,
+							podIPv6:     cfg.PodIPv6,
+						}
+						go func() {
+							if err := ip.run(ctx, opts); err != nil {
+								ingressSvcsErrorChan <- err
+							}
+						}()
+					}
 
 					// Wait on tailscaled process. It won't be cleaned up by default when the
 					// container exits as it is not PID1. TODO (irbekrm): perhaps we can replace the
@@ -734,6 +756,8 @@ runLoop:
 			resetTimer(false)
 		case e := <-egressSvcsErrorChan:
 			return fmt.Errorf("egress proxy failed: %v", e)
+		case e := <-ingressSvcsErrorChan:
+			return fmt.Errorf("ingress proxy failed: %v", e)
 		}
 	}
 	wg.Wait()
