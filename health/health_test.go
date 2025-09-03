@@ -5,12 +5,14 @@ package health
 
 import (
 	"fmt"
+	"maps"
 	"reflect"
 	"slices"
 	"strconv"
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest"
 	"tailscale.com/types/opt"
@@ -25,6 +27,7 @@ func TestAppendWarnableDebugFlags(t *testing.T) {
 		w := Register(&Warnable{
 			Code:         WarnableCode(fmt.Sprintf("warnable-code-%d", i)),
 			MapDebugFlag: fmt.Sprint(i),
+			Text:         StaticMessage(""),
 		})
 		defer unregister(w)
 		if i%2 == 0 {
@@ -114,7 +117,9 @@ func TestWatcher(t *testing.T) {
 	becameUnhealthy := make(chan struct{})
 	becameHealthy := make(chan struct{})
 
-	watcherFunc := func(w *Warnable, us *UnhealthyState) {
+	watcherFunc := func(c Change) {
+		w := c.Warnable
+		us := c.UnhealthyState
 		if w != testWarnable {
 			t.Fatalf("watcherFunc was called, but with an unexpected Warnable: %v, want: %v", w, testWarnable)
 		}
@@ -184,7 +189,9 @@ func TestSetUnhealthyWithTimeToVisible(t *testing.T) {
 	becameUnhealthy := make(chan struct{})
 	becameHealthy := make(chan struct{})
 
-	watchFunc := func(w *Warnable, us *UnhealthyState) {
+	watchFunc := func(c Change) {
+		w := c.Warnable
+		us := c.UnhealthyState
 		if w != mw {
 			t.Fatalf("watcherFunc was called, but with an unexpected Warnable: %v, want: %v", w, w)
 		}
@@ -457,60 +464,179 @@ func TestControlHealth(t *testing.T) {
 	ht.SetIPNState("NeedsLogin", true)
 	ht.GotStreamedMapResponse()
 
-	ht.SetControlHealth([]string{"Test message"})
-	state := ht.CurrentState()
-	warning, ok := state.Warnings["control-health"]
+	baseWarns := ht.CurrentState().Warnings
+	baseStrs := ht.Strings()
 
-	if !ok {
-		t.Fatal("no warning found in current state with code 'control-health'")
+	msgs := map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
+		"test": {
+			Title: "Control health message",
+			Text:  "Extra help.",
+		},
+		"title": {
+			Title: "Control health title only",
+		},
+		"with-action": {
+			Title: "Control health message",
+			Text:  "Extra help.",
+			PrimaryAction: &tailcfg.DisplayMessageAction{
+				URL:   "http://www.example.com",
+				Label: "Learn more",
+			},
+		},
 	}
-	if got, want := warning.Title, "Coordination server reports an issue"; got != want {
-		t.Errorf("warning.Title = %q, want %q", got, want)
-	}
-	if got, want := warning.Severity, SeverityMedium; got != want {
-		t.Errorf("warning.Severity = %s, want %s", got, want)
-	}
-	if got, want := warning.Text, "The coordination server is reporting an health issue: Test message"; got != want {
-		t.Errorf("warning.Text = %q, want %q", got, want)
-	}
-}
+	ht.SetControlHealth(msgs)
 
-func TestControlHealthNotifiesOnChange(t *testing.T) {
-	ht := Tracker{}
-	ht.SetIPNState("NeedsLogin", true)
-	ht.GotStreamedMapResponse()
-
-	gotNotified := false
-	ht.registerSyncWatcher(func(_ *Warnable, _ *UnhealthyState) {
-		gotNotified = true
+	t.Run("Warnings", func(t *testing.T) {
+		wantWarns := map[WarnableCode]UnhealthyState{
+			"control-health.test": {
+				WarnableCode: "control-health.test",
+				Severity:     SeverityMedium,
+				Title:        "Control health message",
+				Text:         "Extra help.",
+			},
+			"control-health.title": {
+				WarnableCode: "control-health.title",
+				Severity:     SeverityMedium,
+				Title:        "Control health title only",
+			},
+			"control-health.with-action": {
+				WarnableCode: "control-health.with-action",
+				Severity:     SeverityMedium,
+				Title:        "Control health message",
+				Text:         "Extra help.",
+				PrimaryAction: &UnhealthyStateAction{
+					URL:   "http://www.example.com",
+					Label: "Learn more",
+				},
+			},
+		}
+		state := ht.CurrentState()
+		gotWarns := maps.Clone(state.Warnings)
+		for k := range gotWarns {
+			if _, inBase := baseWarns[k]; inBase {
+				delete(gotWarns, k)
+			}
+		}
+		if diff := cmp.Diff(wantWarns, gotWarns); diff != "" {
+			t.Fatalf(`CurrentState().Warnings["control-health-*"] wrong (-want +got):\n%s`, diff)
+		}
 	})
 
-	ht.SetControlHealth([]string{"Test message"})
-
-	if !gotNotified {
-		t.Errorf("watcher did not get called, want it to be called")
-	}
-}
-
-func TestControlHealthNoNotifyOnUnchanged(t *testing.T) {
-	ht := Tracker{}
-	ht.SetIPNState("NeedsLogin", true)
-	ht.GotStreamedMapResponse()
-
-	// Set up an existing control health issue
-	ht.SetControlHealth([]string{"Test message"})
-
-	// Now register our watcher
-	gotNotified := false
-	ht.registerSyncWatcher(func(_ *Warnable, _ *UnhealthyState) {
-		gotNotified = true
+	t.Run("Strings()", func(t *testing.T) {
+		wantStrs := []string{
+			"Control health message: Extra help.",
+			"Control health message: Extra help. Learn more: http://www.example.com",
+			"Control health title only.",
+		}
+		var gotStrs []string
+		for _, s := range ht.Strings() {
+			if !slices.Contains(baseStrs, s) {
+				gotStrs = append(gotStrs, s)
+			}
+		}
+		if diff := cmp.Diff(wantStrs, gotStrs); diff != "" {
+			t.Fatalf(`Strings() wrong (-want +got):\n%s`, diff)
+		}
 	})
 
-	// Send the same control health message again - should not notify
-	ht.SetControlHealth([]string{"Test message"})
+	t.Run("tailscaled_health_messages", func(t *testing.T) {
+		var r usermetric.Registry
+		ht.SetMetricsRegistry(&r)
 
-	if gotNotified {
-		t.Errorf("watcher got called, want it to not be called")
+		got := ht.metricHealthMessage.Get(metricHealthMessageLabel{
+			Type: MetricLabelWarning,
+		}).String()
+		want := strconv.Itoa(
+			len(msgs) + len(baseStrs),
+		)
+		if got != want {
+			t.Errorf("metricsHealthMessage.Get(warning) = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestControlHealthNotifies(t *testing.T) {
+	type test struct {
+		name         string
+		initialState map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage
+		newState     map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage
+		wantNotify   bool
+	}
+	tests := []test{
+		{
+			name: "no-change",
+			initialState: map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
+				"test": {},
+			},
+			newState: map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
+				"test": {},
+			},
+			wantNotify: false,
+		},
+		{
+			name:         "on-set",
+			initialState: map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{},
+			newState: map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
+				"test": {},
+			},
+			wantNotify: true,
+		},
+		{
+			name: "details-change",
+			initialState: map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
+				"test": {
+					Title: "Title",
+				},
+			},
+			newState: map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
+				"test": {
+					Title: "Updated title",
+				},
+			},
+			wantNotify: true,
+		},
+		{
+			name: "action-changes",
+			initialState: map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
+				"test": {
+					PrimaryAction: &tailcfg.DisplayMessageAction{
+						URL:   "http://www.example.com/a/123456",
+						Label: "Sign in",
+					},
+				},
+			},
+			newState: map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
+				"test": {
+					PrimaryAction: &tailcfg.DisplayMessageAction{
+						URL:   "http://www.example.com/a/abcdefg",
+						Label: "Sign in",
+					},
+				},
+			},
+			wantNotify: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ht := Tracker{}
+			ht.SetIPNState("NeedsLogin", true)
+			ht.GotStreamedMapResponse()
+
+			if len(test.initialState) != 0 {
+				ht.SetControlHealth(test.initialState)
+			}
+
+			gotNotified := false
+			ht.registerSyncWatcher(func(_ Change) {
+				gotNotified = true
+			})
+
+			ht.SetControlHealth(test.newState)
+
+			if gotNotified != test.wantNotify {
+				t.Errorf("notified: got %v, want %v", gotNotified, test.wantNotify)
+			}
+		})
 	}
 }
 
@@ -519,11 +645,13 @@ func TestControlHealthIgnoredOutsideMapPoll(t *testing.T) {
 	ht.SetIPNState("NeedsLogin", true)
 
 	gotNotified := false
-	ht.registerSyncWatcher(func(_ *Warnable, _ *UnhealthyState) {
+	ht.registerSyncWatcher(func(_ Change) {
 		gotNotified = true
 	})
 
-	ht.SetControlHealth([]string{"Test message"})
+	ht.SetControlHealth(map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
+		"control-health": {},
+	})
 
 	state := ht.CurrentState()
 	_, ok := state.Warnings["control-health"]

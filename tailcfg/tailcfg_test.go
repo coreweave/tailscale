@@ -67,8 +67,10 @@ func TestHostinfoEqual(t *testing.T) {
 		"UserspaceRouter",
 		"AppConnector",
 		"ServicesHash",
+		"ExitNodeID",
 		"Location",
 		"TPM",
+		"StateEncrypted",
 	}
 	if have := fieldsOf(reflect.TypeFor[Hostinfo]()); !reflect.DeepEqual(have, hiHandles) {
 		t.Errorf("Hostinfo.Equal check might be out of sync\nfields: %q\nhandled: %q\n",
@@ -270,6 +272,21 @@ func TestHostinfoEqual(t *testing.T) {
 		{
 			&Hostinfo{IngressEnabled: false},
 			&Hostinfo{IngressEnabled: true},
+			false,
+		},
+		{
+			&Hostinfo{ExitNodeID: "stable-exit"},
+			&Hostinfo{ExitNodeID: "stable-exit"},
+			true,
+		},
+		{
+			&Hostinfo{ExitNodeID: ""},
+			&Hostinfo{},
+			true,
+		},
+		{
+			&Hostinfo{ExitNodeID: ""},
+			&Hostinfo{ExitNodeID: "stable-exit"},
 			false,
 		},
 	}
@@ -874,6 +891,135 @@ func TestCheckTag(t *testing.T) {
 				t.Errorf("got nil; want error")
 			} else if err != nil && tt.want {
 				t.Errorf("got %v; want nil", err)
+			}
+		})
+	}
+}
+
+func TestDisplayMessageEqual(t *testing.T) {
+	type test struct {
+		name      string
+		value1    DisplayMessage
+		value2    DisplayMessage
+		wantEqual bool
+	}
+
+	for _, test := range []test{
+		{
+			name: "same",
+			value1: DisplayMessage{
+				Title:               "title",
+				Text:                "text",
+				Severity:            SeverityHigh,
+				ImpactsConnectivity: false,
+				PrimaryAction: &DisplayMessageAction{
+					URL:   "https://example.com",
+					Label: "Open",
+				},
+			},
+			value2: DisplayMessage{
+				Title:               "title",
+				Text:                "text",
+				Severity:            SeverityHigh,
+				ImpactsConnectivity: false,
+				PrimaryAction: &DisplayMessageAction{
+					URL:   "https://example.com",
+					Label: "Open",
+				},
+			},
+			wantEqual: true,
+		},
+		{
+			name: "different-title",
+			value1: DisplayMessage{
+				Title: "title",
+			},
+			value2: DisplayMessage{
+				Title: "different title",
+			},
+			wantEqual: false,
+		},
+		{
+			name: "different-text",
+			value1: DisplayMessage{
+				Text: "some text",
+			},
+			value2: DisplayMessage{
+				Text: "different text",
+			},
+			wantEqual: false,
+		},
+		{
+			name: "different-severity",
+			value1: DisplayMessage{
+				Severity: SeverityHigh,
+			},
+			value2: DisplayMessage{
+				Severity: SeverityMedium,
+			},
+			wantEqual: false,
+		},
+		{
+			name: "different-impactsConnectivity",
+			value1: DisplayMessage{
+				ImpactsConnectivity: true,
+			},
+			value2: DisplayMessage{
+				ImpactsConnectivity: false,
+			},
+			wantEqual: false,
+		},
+		{
+			name:   "different-primaryAction-nil-non-nil",
+			value1: DisplayMessage{},
+			value2: DisplayMessage{
+				PrimaryAction: &DisplayMessageAction{
+					URL:   "https://example.com",
+					Label: "Open",
+				},
+			},
+			wantEqual: false,
+		},
+		{
+			name: "different-primaryAction-url",
+			value1: DisplayMessage{
+				PrimaryAction: &DisplayMessageAction{
+					URL:   "https://example.com",
+					Label: "Open",
+				},
+			},
+			value2: DisplayMessage{
+				PrimaryAction: &DisplayMessageAction{
+					URL:   "https://zombo.com",
+					Label: "Open",
+				},
+			},
+			wantEqual: false,
+		},
+		{
+			name: "different-primaryAction-label",
+			value1: DisplayMessage{
+				PrimaryAction: &DisplayMessageAction{
+					URL:   "https://example.com",
+					Label: "Open",
+				},
+			},
+			value2: DisplayMessage{
+				PrimaryAction: &DisplayMessageAction{
+					URL:   "https://example.com",
+					Label: "Learn more",
+				},
+			},
+			wantEqual: false,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := test.value1.Equal(test.value2)
+
+			if got != test.wantEqual {
+				value1 := must.Get(json.MarshalIndent(test.value1, "", "  "))
+				value2 := must.Get(json.MarshalIndent(test.value2, "", "  "))
+				t.Errorf("value1.Equal(value2): got %t, want %t\nvalue1:\n%s\nvalue2:\n%s", got, test.wantEqual, value1, value2)
 			}
 		})
 	}

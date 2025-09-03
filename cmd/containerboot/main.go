@@ -121,7 +121,10 @@ import (
 	"tailscale.com/client/tailscale"
 	"tailscale.com/ipn"
 	kubeutils "tailscale.com/k8s-operator"
+	healthz "tailscale.com/kube/health"
 	"tailscale.com/kube/kubetypes"
+	"tailscale.com/kube/metrics"
+	"tailscale.com/kube/services"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/ptr"
@@ -188,6 +191,14 @@ func run() error {
 		if err := cfg.setupKube(bootCtx, kc); err != nil {
 			return fmt.Errorf("error setting up for running on Kubernetes: %w", err)
 		}
+		// Clear out any state from previous runs of containerboot. Check
+		// hasKubeStateStore because although we know we're in kube, that
+		// doesn't guarantee the state store is properly configured.
+		if hasKubeStateStore(cfg) {
+			if err := kc.resetContainerbootState(bootCtx, cfg.PodUID); err != nil {
+				return fmt.Errorf("error clearing previous state from Secret: %w", err)
+			}
+		}
 	}
 
 	client, daemonProcess, err := startTailscaled(bootCtx, cfg)
@@ -202,7 +213,7 @@ func run() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 		defer cancel()
 
-		if err := ensureServicesNotAdvertised(ctx, client); err != nil {
+		if err := services.EnsureServicesNotAdvertised(ctx, client, log.Printf); err != nil {
 			log.Printf("Error ensuring services are not advertised: %v", err)
 		}
 
@@ -223,13 +234,13 @@ func run() error {
 	}
 	defer killTailscaled()
 
-	var healthCheck *healthz
+	var healthCheck *healthz.Healthz
 	ep := &egressProxy{}
 	if cfg.HealthCheckAddrPort != "" {
 		mux := http.NewServeMux()
 
 		log.Printf("Running healthcheck endpoint at %s/healthz", cfg.HealthCheckAddrPort)
-		healthCheck = registerHealthHandlers(mux, cfg.PodIPv4)
+		healthCheck = healthz.RegisterHealthHandlers(mux, cfg.PodIPv4, log.Printf)
 
 		close := runHTTPServer(mux, cfg.HealthCheckAddrPort)
 		defer close()
@@ -240,12 +251,12 @@ func run() error {
 
 		if cfg.localMetricsEnabled() {
 			log.Printf("Running metrics endpoint at %s/metrics", cfg.LocalAddrPort)
-			registerMetricsHandlers(mux, client, cfg.DebugAddrPort)
+			metrics.RegisterMetricsHandlers(mux, client, cfg.DebugAddrPort)
 		}
 
 		if cfg.localHealthEnabled() {
 			log.Printf("Running healthcheck endpoint at %s/healthz", cfg.LocalAddrPort)
-			healthCheck = registerHealthHandlers(mux, cfg.PodIPv4)
+			healthCheck = healthz.RegisterHealthHandlers(mux, cfg.PodIPv4, log.Printf)
 		}
 
 		if cfg.egressSvcsTerminateEPEnabled() {
@@ -367,11 +378,6 @@ authLoop:
 		if err := client.SetServeConfig(ctx, new(ipn.ServeConfig)); err != nil {
 			return fmt.Errorf("failed to unset serve config: %w", err)
 		}
-		if hasKubeStateStore(cfg) {
-			if err := kc.storeHTTPSEndpoint(ctx, ""); err != nil {
-				return fmt.Errorf("failed to update HTTPS endpoint in tailscale state: %w", err)
-			}
-		}
 	}
 
 	if hasKubeStateStore(cfg) && isTwoStepConfigAuthOnce(cfg) {
@@ -381,12 +387,6 @@ authLoop:
 		log.Printf("Deleting authkey from kube secret")
 		if err := kc.deleteAuthKey(ctx); err != nil {
 			return fmt.Errorf("deleting authkey from kube secret: %w", err)
-		}
-	}
-
-	if hasKubeStateStore(cfg) {
-		if err := kc.storeCapVerUID(ctx, cfg.PodUID); err != nil {
-			return fmt.Errorf("storing capability version and UID: %w", err)
 		}
 	}
 
@@ -440,8 +440,8 @@ authLoop:
 	)
 	// egressSvcsErrorChan will get an error sent to it if this containerboot instance is configured to expose 1+
 	// egress services in HA mode and errored.
-	var egressSvcsErrorChan = make(chan error)
-	var ingressSvcsErrorChan = make(chan error)
+	egressSvcsErrorChan := make(chan error)
+	ingressSvcsErrorChan := make(chan error)
 	defer t.Stop()
 	// resetTimer resets timer for when to next attempt to resolve the DNS
 	// name for the proxy configured with TS_EXPERIMENTAL_DEST_DNS_NAME. The
@@ -646,7 +646,7 @@ runLoop:
 				}
 
 				if healthCheck != nil {
-					healthCheck.update(len(addrs) != 0)
+					healthCheck.Update(len(addrs) != 0)
 				}
 
 				if cfg.ServeConfigPath != "" {
