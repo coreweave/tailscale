@@ -651,7 +651,9 @@ func (c *Conn) onUDPRelayAllocResp(allocResp UDPRelayAllocResp) {
 	ep.mu.Lock()
 	defer ep.mu.Unlock()
 	derpAddr := ep.derpAddr
-	go c.sendDiscoMessage(epAddr{ap: derpAddr}, ep.publicKey, disco.key, allocResp.Message, discoVerboseLog)
+	if derpAddr.IsValid() {
+		go c.sendDiscoMessage(epAddr{ap: derpAddr}, ep.publicKey, disco.key, allocResp.Message, discoVerboseLog)
+	}
 }
 
 // Synchronize waits for all [eventbus] events published
@@ -719,9 +721,13 @@ func NewConn(opts Options) (*Conn, error) {
 		newPortMapper, ok := portmappertype.HookNewPortMapper.GetOk()
 		if ok {
 			c.portMapper = newPortMapper(portmapperLogf, opts.EventBus, opts.NetMon, disableUPnP, c.onlyTCP443.Load)
-		} else if !testenv.InTest() {
-			panic("unexpected: HookNewPortMapper not set")
 		}
+		// If !ok, the HookNewPortMapper hook is not set (so feature/portmapper
+		// isn't linked), but the build tag to explicitly omit the portmapper
+		// isn't set either. This should only happen to js/wasm builds, where
+		// the portmapper is a no-op even if linked (but it's no longer linked,
+		// since the move to feature/portmapper), or if people are wiring up
+		// their own Tailscale build from pieces.
 	}
 
 	c.netMon = opts.NetMon
@@ -2438,7 +2444,10 @@ func (c *Conn) handleDiscoMessage(msg []byte, src epAddr, shouldBeRelayHandshake
 		if !nodeHasCap(c.filt, c.peers.At(peerI), c.self, tailcfg.PeerCapabilityRelay) {
 			return
 		}
-		c.allocRelayEndpointPub.Publish(UDPRelayAllocReq{
+		// [Conn.mu] must not be held while publishing, or [Conn.onUDPRelayAllocResp]
+		// can deadlock as the req sub and resp pub are the same goroutine.
+		// See #17830.
+		go c.allocRelayEndpointPub.Publish(UDPRelayAllocReq{
 			RxFromDiscoKey: sender,
 			RxFromNodeKey:  nodeKey,
 			Message:        req,
