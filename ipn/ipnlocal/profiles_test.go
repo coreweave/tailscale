@@ -4,6 +4,7 @@
 package ipnlocal
 
 import (
+	"errors"
 	"fmt"
 	"os/user"
 	"strconv"
@@ -151,6 +152,7 @@ func TestProfileDupe(t *testing.T) {
 				ID:        tailcfg.UserID(user),
 				LoginName: fmt.Sprintf("user%d@example.com", user),
 			},
+			AttestationKey: nil,
 		}
 	}
 	user1Node1 := newPersist(1, 1)
@@ -1128,10 +1130,12 @@ func TestProfileStateChangeCallback(t *testing.T) {
 			}
 
 			gotChanges := make([]stateChange, 0, len(tt.wantChanges))
-			pm.StateChangeHook = func(profile ipn.LoginProfileView, prefs ipn.PrefsView, sameNode bool) {
+			pm.StateChangeHook = func(profile ipn.LoginProfileView, prefView ipn.PrefsView, sameNode bool) {
+				prefs := prefView.AsStruct()
+				prefs.Sync = prefs.Sync.Normalized()
 				gotChanges = append(gotChanges, stateChange{
 					Profile:  profile.AsStruct(),
-					Prefs:    prefs.AsStruct(),
+					Prefs:    prefs,
 					SameNode: sameNode,
 				})
 			}
@@ -1143,4 +1147,41 @@ func TestProfileStateChangeCallback(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestProfileBadAttestationKey(t *testing.T) {
+	store := new(mem.Store)
+	pm, err := newProfileManagerWithGOOS(store, t.Logf, health.NewTracker(eventbustest.NewBus(t)), "linux")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fk := new(failingHardwareAttestationKey)
+	pm.newEmptyHardwareAttestationKey = func() (key.HardwareAttestationKey, error) {
+		return fk, nil
+	}
+	sk := ipn.StateKey(t.Name())
+	if err := pm.store.WriteState(sk, []byte(`{"Config": {"AttestationKey": {}}}`)); err != nil {
+		t.Fatal(err)
+	}
+	prefs, err := pm.loadSavedPrefs(sk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ak := prefs.Persist().AsStruct().AttestationKey
+	if _, ok := ak.(noopAttestationKey); !ok {
+		t.Errorf("loaded attestation key of type %T, want noopAttestationKey", ak)
+	}
+	if !fk.unmarshalCalled {
+		t.Error("UnmarshalJSON was not called on failingHardwareAttestationKey")
+	}
+}
+
+type failingHardwareAttestationKey struct {
+	noopAttestationKey
+	unmarshalCalled bool
+}
+
+func (k *failingHardwareAttestationKey) UnmarshalJSON([]byte) error {
+	k.unmarshalCalled = true
+	return errors.New("failed to unmarshal attestation key!")
 }
