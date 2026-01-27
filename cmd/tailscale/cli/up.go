@@ -23,7 +23,6 @@ import (
 
 	shellquote "github.com/kballard/go-shellquote"
 	"github.com/peterbourgon/ff/v3/ffcli"
-	qrcode "github.com/skip2/go-qrcode"
 	"tailscale.com/feature/buildfeatures"
 	_ "tailscale.com/feature/condregister/identityfederation"
 	_ "tailscale.com/feature/condregister/oauthkey"
@@ -39,6 +38,7 @@ import (
 	"tailscale.com/types/preftype"
 	"tailscale.com/types/views"
 	"tailscale.com/util/dnsname"
+	"tailscale.com/util/qrcodes"
 	"tailscale.com/util/syspolicy/policyclient"
 	"tailscale.com/version/distro"
 )
@@ -94,9 +94,12 @@ func newUpFlagSet(goos string, upArgs *upArgsT, cmd string) *flag.FlagSet {
 
 	// When adding new flags, prefer to put them under "tailscale set" instead
 	// of here. Setting preferences via "tailscale up" is deprecated.
-	upf.BoolVar(&upArgs.qr, "qr", false, "show QR code for login URLs")
-	upf.StringVar(&upArgs.qrFormat, "qr-format", "small", "QR code formatting (small or large)")
+	if buildfeatures.HasQRCodes {
+		upf.BoolVar(&upArgs.qr, "qr", false, "show QR code for login URLs")
+		upf.StringVar(&upArgs.qrFormat, "qr-format", string(qrcodes.FormatAuto), fmt.Sprintf("QR code formatting (%s, %s, %s, %s)", qrcodes.FormatAuto, qrcodes.FormatASCII, qrcodes.FormatLarge, qrcodes.FormatSmall))
+	}
 	upf.StringVar(&upArgs.authKeyOrFile, "auth-key", "", `node authorization key; if it begins with "file:", then it's a path to a file containing the authkey`)
+	upf.StringVar(&upArgs.audience, "audience", "", "Audience used when requesting an ID token from an identity provider for auth keys via workload identity federation")
 	upf.StringVar(&upArgs.clientID, "client-id", "", "Client ID used to generate authkeys via workload identity federation")
 	upf.StringVar(&upArgs.clientSecretOrFile, "client-secret", "", `Client Secret used to generate authkeys via OAuth; if it begins with "file:", then it's a path to a file containing the secret`)
 	upf.StringVar(&upArgs.idTokenOrFile, "id-token", "", `ID token from the identity provider to exchange with the control server for workload identity federation; if it begins with "file:", then it's a path to a file containing the token`)
@@ -137,14 +140,17 @@ func newUpFlagSet(goos string, upArgs *upArgsT, cmd string) *flag.FlagSet {
 		// Some flags are only for "up", not "login".
 		upf.BoolVar(&upArgs.json, "json", false, "output in JSON format (WARNING: format subject to change)")
 		upf.BoolVar(&upArgs.reset, "reset", false, "reset unspecified settings to their default values")
-		upf.BoolVar(&upArgs.forceReauth, "force-reauth", false, "force reauthentication (WARNING: this will bring down the Tailscale connection and thus should not be done remotely over SSH or RDP)")
+
+		// There's no --force-reauth flag on "login" because all login commands
+		// trigger a reauth.
+		upf.BoolVar(&upArgs.forceReauth, "force-reauth", false, "force reauthentication (WARNING: this may bring down the Tailscale connection and thus should not be done remotely over SSH or RDP)")
 		registerAcceptRiskFlag(upf, &upArgs.acceptedRisks)
 	}
 
 	return upf
 }
 
-// notFalseVar is is a flag.Value that can only be "true", if set.
+// notFalseVar is a flag.Value that can only be "true", if set.
 type notFalseVar struct{}
 
 func (notFalseVar) IsBoolFlag() bool { return true }
@@ -189,6 +195,7 @@ type upArgsT struct {
 	netfilterMode          string
 	authKeyOrFile          string // "secret" or "file:/path/to/secret"
 	clientID               string
+	audience               string
 	clientSecretOrFile     string // "secret" or "file:/path/to/secret"
 	idTokenOrFile          string // "secret" or "file:/path/to/secret"
 	hostname               string
@@ -623,7 +630,7 @@ func runUp(ctx context.Context, cmd string, args []string, upArgs upArgsT) (retE
 				return err
 			}
 
-			authKey, err = f(ctx, prefs.ControlURL, upArgs.clientID, idToken, strings.Split(upArgs.advertiseTags, ","))
+			authKey, err = f(ctx, prefs.ControlURL, upArgs.clientID, idToken, upArgs.audience, strings.Split(upArgs.advertiseTags, ","))
 			if err != nil {
 				return err
 			}
@@ -717,9 +724,8 @@ func runUp(ctx context.Context, cmd string, args []string, upArgs upArgsT) (retE
 				if upArgs.json {
 					js := &upOutputJSON{AuthURL: authURL, BackendState: st.BackendState}
 
-					q, err := qrcode.New(authURL, qrcode.Medium)
-					if err == nil {
-						png, err := q.PNG(128)
+					if buildfeatures.HasQRCodes {
+						png, err := qrcodes.EncodePNG(authURL, 128)
 						if err == nil {
 							js.QR = "data:image/png;base64," + base64.StdEncoding.EncodeToString(png)
 						}
@@ -733,19 +739,10 @@ func runUp(ctx context.Context, cmd string, args []string, upArgs upArgsT) (retE
 					}
 				} else {
 					fmt.Fprintf(Stderr, "\nTo authenticate, visit:\n\n\t%s\n\n", authURL)
-					if upArgs.qr {
-						q, err := qrcode.New(authURL, qrcode.Medium)
+					if upArgs.qr && buildfeatures.HasQRCodes {
+						_, err := qrcodes.Fprintln(Stderr, qrcodes.Format(upArgs.qrFormat), authURL)
 						if err != nil {
-							log.Printf("QR code error: %v", err)
-						} else {
-							switch upArgs.qrFormat {
-							case "large":
-								fmt.Fprintf(Stderr, "%s\n", q.ToString(false))
-							case "small":
-								fmt.Fprintf(Stderr, "%s\n", q.ToSmallString(false))
-							default:
-								log.Printf("unknown QR code format: %q", upArgs.qrFormat)
-							}
+							log.Print(err)
 						}
 					}
 				}
@@ -910,7 +907,7 @@ func addPrefFlagMapping(flagName string, prefNames ...string) {
 // correspond to an ipn.Pref.
 func preflessFlag(flagName string) bool {
 	switch flagName {
-	case "auth-key", "force-reauth", "reset", "qr", "qr-format", "json", "timeout", "accept-risk", "host-routes", "client-id", "client-secret", "id-token":
+	case "auth-key", "force-reauth", "reset", "qr", "qr-format", "json", "timeout", "accept-risk", "host-routes", "client-id", "audience", "client-secret", "id-token":
 		return true
 	}
 	return false

@@ -60,6 +60,7 @@ import (
 	"tailscale.com/types/nettype"
 	"tailscale.com/types/views"
 	"tailscale.com/util/clientmetric"
+	"tailscale.com/util/cloudinfo"
 	"tailscale.com/util/eventbus"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/ringlog"
@@ -213,7 +214,7 @@ type Conn struct {
 	bind *connBind
 
 	// cloudInfo is used to query cloud metadata services.
-	cloudInfo *cloudInfo
+	cloudInfo *cloudinfo.CloudInfo
 
 	// ============================================================
 	// Fields that must be accessed via atomic load/stores.
@@ -405,6 +406,10 @@ type Conn struct {
 
 	// metrics contains the metrics for the magicsock instance.
 	metrics *metrics
+
+	// homeDERPGauge is the usermetric gauge for the home DERP region ID.
+	// This can be nil when [Options.Metrics] are not enabled.
+	homeDERPGauge *usermetric.Gauge
 }
 
 // SetDebugLoggingEnabled controls whether spammy debug logging is enabled.
@@ -597,7 +602,7 @@ func newConn(logf logger.Logf) *Conn {
 		peerLastDerp: make(map[key.NodePublic]int),
 		peerMap:      newPeerMap(),
 		discoInfo:    make(map[key.DiscoPublic]*discoInfo),
-		cloudInfo:    newCloudInfo(logf),
+		cloudInfo:    cloudinfo.New(logf),
 	}
 	c.discoAtomic.Set(discoPrivate)
 	c.bind = &connBind{Conn: c, closed: true}
@@ -743,6 +748,9 @@ func NewConn(opts Options) (*Conn, error) {
 	}
 
 	c.metrics = registerMetrics(opts.Metrics)
+	if opts.Metrics != nil {
+		c.homeDERPGauge = opts.Metrics.NewGauge("tailscaled_home_derp_region_id", "DERP region ID of this node's home relay server")
+	}
 
 	if d4, err := c.listenRawDisco("ip4"); err == nil {
 		c.logf("[v1] using BPF disco receiver for IPv4")
@@ -4104,6 +4112,11 @@ var (
 	metricUDPLifetimeCycleCompleteAt10sCliff     = newUDPLifetimeCounter("magicsock_udp_lifetime_cycle_complete_at_10s_cliff")
 	metricUDPLifetimeCycleCompleteAt30sCliff     = newUDPLifetimeCounter("magicsock_udp_lifetime_cycle_complete_at_30s_cliff")
 	metricUDPLifetimeCycleCompleteAt60sCliff     = newUDPLifetimeCounter("magicsock_udp_lifetime_cycle_complete_at_60s_cliff")
+
+	// TSMP disco key exchange
+	metricTSMPDiscoKeyAdvertisementReceived  = clientmetric.NewCounter("magicsock_tsmp_disco_key_advertisement_received")
+	metricTSMPDiscoKeyAdvertisementApplied   = clientmetric.NewCounter("magicsock_tsmp_disco_key_advertisement_applied")
+	metricTSMPDiscoKeyAdvertisementUnchanged = clientmetric.NewCounter("magicsock_tsmp_disco_key_advertisement_unchanged")
 )
 
 // newUDPLifetimeCounter returns a new *clientmetric.Metric with the provided
@@ -4263,4 +4276,41 @@ func (c *Conn) PeerRelays() set.Set[netip.Addr] {
 		servers.Add(pi.ep.nodeAddr)
 	}
 	return servers
+}
+
+// HandleDiscoKeyAdvertisement processes a TSMP disco key update.
+// The update may be solicited (in response to a request) or unsolicited.
+// node is the Tailscale tailcfg.NodeView of the peer that sent the update.
+func (c *Conn) HandleDiscoKeyAdvertisement(node tailcfg.NodeView, update packet.TSMPDiscoKeyAdvertisement) {
+	discoKey := update.Key
+	c.logf("magicsock: received disco key update %v from %v", discoKey.ShortString(), node.StableID())
+	metricTSMPDiscoKeyAdvertisementReceived.Add(1)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nodeKey := node.Key()
+
+	ep, ok := c.peerMap.endpointForNodeKey(nodeKey)
+	if !ok {
+		c.logf("magicsock: endpoint not found for node %v", nodeKey.ShortString())
+		return
+	}
+
+	oldDiscoKey := key.DiscoPublic{}
+	if epDisco := ep.disco.Load(); epDisco != nil {
+		oldDiscoKey = epDisco.key
+	}
+	// If the key did not change, count it and return.
+	if oldDiscoKey.Compare(discoKey) == 0 {
+		metricTSMPDiscoKeyAdvertisementUnchanged.Add(1)
+		return
+	}
+	c.discoInfoForKnownPeerLocked(discoKey)
+	ep.disco.Store(&endpointDisco{
+		key:   discoKey,
+		short: discoKey.ShortString(),
+	})
+	c.peerMap.upsertEndpoint(ep, oldDiscoKey)
+	c.logf("magicsock: updated disco key for peer %v to %v", nodeKey.ShortString(), discoKey.ShortString())
+	metricTSMPDiscoKeyAdvertisementApplied.Add(1)
 }
