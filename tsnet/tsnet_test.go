@@ -13,6 +13,8 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
@@ -27,18 +29,23 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
 	"golang.org/x/net/proxy"
+
 	"tailscale.com/client/local"
 	"tailscale.com/cmd/testwrapper/flakytest"
+	"tailscale.com/internal/client/tailscale"
 	"tailscale.com/ipn"
+	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/ipn/store/mem"
 	"tailscale.com/net/netns"
 	"tailscale.com/tailcfg"
@@ -48,6 +55,8 @@ import (
 	"tailscale.com/tstest/integration/testcontrol"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/views"
+	"tailscale.com/util/mak"
 	"tailscale.com/util/must"
 )
 
@@ -133,7 +142,7 @@ func startControl(t *testing.T) (controlURL string, control *testcontrol.Server)
 
 type testCertIssuer struct {
 	mu    sync.Mutex
-	certs map[string]*tls.Certificate
+	certs map[string]ipnlocal.TLSCertKeyPair // keyed by hostname
 
 	root    *x509.Certificate
 	rootKey *ecdsa.PrivateKey
@@ -165,18 +174,18 @@ func newCertIssuer() *testCertIssuer {
 		panic(err)
 	}
 	return &testCertIssuer{
-		certs:   make(map[string]*tls.Certificate),
 		root:    rootCA,
 		rootKey: rootKey,
+		certs:   map[string]ipnlocal.TLSCertKeyPair{},
 	}
 }
 
-func (tci *testCertIssuer) getCert(chi *tls.ClientHelloInfo) (*tls.Certificate, error) {
+func (tci *testCertIssuer) getCert(hostname string) (*ipnlocal.TLSCertKeyPair, error) {
 	tci.mu.Lock()
 	defer tci.mu.Unlock()
-	cert, ok := tci.certs[chi.ServerName]
+	cert, ok := tci.certs[hostname]
 	if ok {
-		return cert, nil
+		return &cert, nil
 	}
 
 	certPrivKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -185,7 +194,7 @@ func (tci *testCertIssuer) getCert(chi *tls.ClientHelloInfo) (*tls.Certificate, 
 	}
 	certTmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
-		DNSNames:     []string{chi.ServerName},
+		DNSNames:     []string{hostname},
 		NotBefore:    time.Now(),
 		NotAfter:     time.Now().Add(time.Hour),
 	}
@@ -193,12 +202,22 @@ func (tci *testCertIssuer) getCert(chi *tls.ClientHelloInfo) (*tls.Certificate, 
 	if err != nil {
 		return nil, err
 	}
-	cert = &tls.Certificate{
-		Certificate: [][]byte{certDER, tci.root.Raw},
-		PrivateKey:  certPrivKey,
+	keyDER, err := x509.MarshalPKCS8PrivateKey(certPrivKey)
+	if err != nil {
+		return nil, err
 	}
-	tci.certs[chi.ServerName] = cert
-	return cert, nil
+	cert = ipnlocal.TLSCertKeyPair{
+		CertPEM: pem.EncodeToMemory(&pem.Block{
+			Type:  "CERTIFICATE",
+			Bytes: certDER,
+		}),
+		KeyPEM: pem.EncodeToMemory(&pem.Block{
+			Type:  "PRIVATE KEY",
+			Bytes: keyDER,
+		}),
+	}
+	tci.certs[hostname] = cert
+	return &cert, nil
 }
 
 func (tci *testCertIssuer) Pool() *x509.CertPool {
@@ -215,12 +234,11 @@ func startServer(t *testing.T, ctx context.Context, controlURL, hostname string)
 	tmp := filepath.Join(t.TempDir(), hostname)
 	os.MkdirAll(tmp, 0755)
 	s := &Server{
-		Dir:               tmp,
-		ControlURL:        controlURL,
-		Hostname:          hostname,
-		Store:             new(mem.Store),
-		Ephemeral:         true,
-		getCertForTesting: testCertRoot.getCert,
+		Dir:        tmp,
+		ControlURL: controlURL,
+		Hostname:   hostname,
+		Store:      new(mem.Store),
+		Ephemeral:  true,
 	}
 	if *verboseNodes {
 		s.Logf = t.Logf
@@ -231,6 +249,8 @@ func startServer(t *testing.T, ctx context.Context, controlURL, hostname string)
 	if err != nil {
 		t.Fatal(err)
 	}
+	s.lb.ConfigureCertsForTest(testCertRoot.getCert)
+
 	return s, status.TailscaleIPs[0], status.Self.PublicKey
 }
 
@@ -256,12 +276,11 @@ func TestDialBlocks(t *testing.T) {
 	tmp := filepath.Join(t.TempDir(), "s2")
 	os.MkdirAll(tmp, 0755)
 	s2 := &Server{
-		Dir:               tmp,
-		ControlURL:        controlURL,
-		Hostname:          "s2",
-		Store:             new(mem.Store),
-		Ephemeral:         true,
-		getCertForTesting: testCertRoot.getCert,
+		Dir:        tmp,
+		ControlURL: controlURL,
+		Hostname:   "s2",
+		Store:      new(mem.Store),
+		Ephemeral:  true,
 	}
 	if *verboseNodes {
 		s2.Logf = log.Printf
@@ -737,6 +756,466 @@ func TestFunnel(t *testing.T) {
 	}
 	if string(body) != "hello" {
 		t.Errorf("unexpected body: %q", body)
+	}
+}
+
+// TestFunnelClose ensures that the listener returned by ListenFunnel cleans up
+// after itself when closed. Specifically, changes made to the serve config
+// should be cleared.
+func TestFunnelClose(t *testing.T) {
+	marshalServeConfig := func(t *testing.T, sc ipn.ServeConfigView) string {
+		t.Helper()
+		return string(must.Get(json.MarshalIndent(sc, "", "\t")))
+	}
+
+	t.Run("simple", func(t *testing.T) {
+		controlURL, _ := startControl(t)
+		s, _, _ := startServer(t, t.Context(), controlURL, "s")
+
+		before := s.lb.ServeConfig()
+
+		ln := must.Get(s.ListenFunnel("tcp", ":443"))
+		ln.Close()
+
+		after := s.lb.ServeConfig()
+		if diff := cmp.Diff(marshalServeConfig(t, after), marshalServeConfig(t, before)); diff != "" {
+			t.Fatalf("expected serve config to be unchanged after close (-got, +want):\n%s", diff)
+		}
+	})
+
+	// Closing the listener shouldn't clear out config that predates it.
+	t.Run("no_clobbering", func(t *testing.T) {
+		controlURL, _ := startControl(t)
+		s, _, _ := startServer(t, t.Context(), controlURL, "s")
+
+		// To obtain config the listener might want to clobber, we:
+		//  - run a listener
+		//  - grab the config
+		//  - close the listener (clearing config)
+		ln := must.Get(s.ListenFunnel("tcp", ":443"))
+		before := s.lb.ServeConfig()
+		ln.Close()
+
+		// Now we manually write the config to the local backend (it should have
+		// been cleared), run the listener again, and close it again.
+		must.Do(s.lb.SetServeConfig(before.AsStruct(), ""))
+		ln = must.Get(s.ListenFunnel("tcp", ":443"))
+		ln.Close()
+
+		// The config should not have been cleared this time since it predated
+		// the most recent run.
+		after := s.lb.ServeConfig()
+		if diff := cmp.Diff(marshalServeConfig(t, after), marshalServeConfig(t, before)); diff != "" {
+			t.Fatalf("expected existing config to remain intact (-got, +want):\n%s", diff)
+		}
+	})
+
+	// Closing one listener shouldn't affect config for another listener.
+	t.Run("two_listeners", func(t *testing.T) {
+		controlURL, _ := startControl(t)
+		s, _, _ := startServer(t, t.Context(), controlURL, "s1")
+
+		// Start a listener on 443.
+		ln1 := must.Get(s.ListenFunnel("tcp", ":443"))
+		defer ln1.Close()
+
+		// Save the serve config for this original listener.
+		before := s.lb.ServeConfig()
+
+		// Now start and close a new listener on a different port.
+		ln2 := must.Get(s.ListenFunnel("tcp", ":8080"))
+		ln2.Close()
+
+		// The serve config for the original listener should be intact.
+		after := s.lb.ServeConfig()
+		if diff := cmp.Diff(marshalServeConfig(t, after), marshalServeConfig(t, before)); diff != "" {
+			t.Fatalf("expected existing config to remain intact (-got, +want):\n%s", diff)
+		}
+	})
+
+	// It should be possible to close a listener and free system resources even
+	// when the Server has been closed (or the listener should be automatically
+	// closed).
+	t.Run("after_server_close", func(t *testing.T) {
+		controlURL, _ := startControl(t)
+		s, _, _ := startServer(t, t.Context(), controlURL, "s")
+
+		ln := must.Get(s.ListenFunnel("tcp", ":443"))
+
+		// Close the server, then close the listener.
+		must.Do(s.Close())
+		// We don't care whether we get an error from the listener closing.
+		ln.Close()
+
+		// The listener should immediately return an error indicating closure.
+		_, err := ln.Accept()
+		// Looking for a string in the error sucks, but it's supposed to stay
+		// consistent:
+		// https://github.com/golang/go/blob/108b333d510c1f60877ac917375d7931791acfe6/src/internal/poll/fd.go#L20-L24
+		if err == nil || !strings.Contains(err.Error(), "use of closed network connection") {
+			t.Fatal("expected listener to be closed, got:", err)
+		}
+	})
+}
+
+func TestListenService(t *testing.T) {
+	// First test an error case which doesn't require all of the fancy setup.
+	t.Run("untagged_node_error", func(t *testing.T) {
+		ctx := t.Context()
+
+		controlURL, _ := startControl(t)
+		serviceHost, _, _ := startServer(t, ctx, controlURL, "service-host")
+
+		ln, err := serviceHost.ListenService("svc:foo", ServiceModeTCP{Port: 8080})
+		if ln != nil {
+			ln.Close()
+		}
+		if !errors.Is(err, ErrUntaggedServiceHost) {
+			t.Fatalf("expected %v, got %v", ErrUntaggedServiceHost, err)
+		}
+	})
+
+	// Now on to the fancier tests.
+
+	type dialFn func(context.Context, string, string) (net.Conn, error)
+
+	// TCP helpers
+	acceptAndEcho := func(t *testing.T, ln net.Listener) {
+		t.Helper()
+		conn, err := ln.Accept()
+		if err != nil {
+			t.Error("accept error:", err)
+			return
+		}
+		defer conn.Close()
+		if _, err := io.Copy(conn, conn); err != nil {
+			t.Error("copy error:", err)
+		}
+	}
+	assertEcho := func(t *testing.T, conn net.Conn) {
+		t.Helper()
+		msg := "echo"
+		buf := make([]byte, 1024)
+		if _, err := conn.Write([]byte(msg)); err != nil {
+			t.Fatal("write failed:", err)
+		}
+		n, err := conn.Read(buf)
+		if err != nil {
+			t.Fatal("read failed:", err)
+		}
+		got := string(buf[:n])
+		if got != msg {
+			t.Fatalf("unexpected response:\n\twant: %s\n\tgot: %s", msg, got)
+		}
+	}
+
+	// HTTP helpers
+	checkAndEcho := func(t *testing.T, ln net.Listener, check func(r *http.Request)) {
+		t.Helper()
+		if check == nil {
+			check = func(*http.Request) {}
+		}
+		http.Serve(ln, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			defer r.Body.Close()
+			check(r)
+			if _, err := io.Copy(w, r.Body); err != nil {
+				t.Error("copy error:", err)
+				w.WriteHeader(http.StatusInternalServerError)
+			}
+		}))
+	}
+	assertEchoHTTP := func(t *testing.T, hostname, path string, dial dialFn) {
+		t.Helper()
+		c := http.Client{
+			Transport: &http.Transport{
+				DialContext: dial,
+			},
+		}
+		msg := "echo"
+		resp, err := c.Post("http://"+hostname+path, "text/plain", strings.NewReader(msg))
+		if err != nil {
+			t.Fatal("posting request:", err)
+		}
+		defer resp.Body.Close()
+		b, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal("reading body:", err)
+		}
+		got := string(b)
+		if got != msg {
+			t.Fatalf("unexpected response:\n\twant: %s\n\tgot: %s", msg, got)
+		}
+	}
+
+	tests := []struct {
+		name string
+
+		// modes is used as input to [Server.ListenService].
+		//
+		// If this slice has multiple modes, then ListenService will be invoked
+		// multiple times. The number of listeners provided to the run function
+		// (below) will always match the number of elements in this slice.
+		modes []ServiceMode
+
+		extraSetup func(t *testing.T, control *testcontrol.Server)
+
+		// run executes the test. This function does not need to close any of
+		// the input resources, but it should close any new resources it opens.
+		// listeners[i] corresponds to inputs[i].
+		run func(t *testing.T, listeners []*ServiceListener, peer *Server)
+	}{
+		{
+			name: "basic_TCP",
+			modes: []ServiceMode{
+				ServiceModeTCP{Port: 99},
+			},
+			run: func(t *testing.T, listeners []*ServiceListener, peer *Server) {
+				go acceptAndEcho(t, listeners[0])
+
+				target := fmt.Sprintf("%s:%d", listeners[0].FQDN, 99)
+				conn := must.Get(peer.Dial(t.Context(), "tcp", target))
+				defer conn.Close()
+
+				assertEcho(t, conn)
+			},
+		},
+		{
+			name: "TLS_terminated_TCP",
+			modes: []ServiceMode{
+				ServiceModeTCP{
+					TerminateTLS: true,
+					Port:         443,
+				},
+			},
+			run: func(t *testing.T, listeners []*ServiceListener, peer *Server) {
+				go acceptAndEcho(t, listeners[0])
+
+				target := fmt.Sprintf("%s:%d", listeners[0].FQDN, 443)
+				conn := must.Get(peer.Dial(t.Context(), "tcp", target))
+				defer conn.Close()
+
+				assertEcho(t, tls.Client(conn, &tls.Config{
+					ServerName: listeners[0].FQDN,
+					RootCAs:    testCertRoot.Pool(),
+				}))
+			},
+		},
+		{
+			name: "identity_headers",
+			modes: []ServiceMode{
+				ServiceModeHTTP{
+					Port: 80,
+				},
+			},
+			run: func(t *testing.T, listeners []*ServiceListener, peer *Server) {
+				expectHeader := "Tailscale-User-Name"
+				go checkAndEcho(t, listeners[0], func(r *http.Request) {
+					if _, ok := r.Header[expectHeader]; !ok {
+						t.Error("did not see expected header:", expectHeader)
+					}
+				})
+				assertEchoHTTP(t, listeners[0].FQDN, "", peer.Dial)
+			},
+		},
+		{
+			name: "identity_headers_TLS",
+			modes: []ServiceMode{
+				ServiceModeHTTP{
+					HTTPS: true,
+					Port:  80,
+				},
+			},
+			run: func(t *testing.T, listeners []*ServiceListener, peer *Server) {
+				expectHeader := "Tailscale-User-Name"
+				go checkAndEcho(t, listeners[0], func(r *http.Request) {
+					if _, ok := r.Header[expectHeader]; !ok {
+						t.Error("did not see expected header:", expectHeader)
+					}
+				})
+
+				dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+					tcpConn, err := peer.Dial(ctx, network, addr)
+					if err != nil {
+						return nil, err
+					}
+					return tls.Client(tcpConn, &tls.Config{
+						ServerName: listeners[0].FQDN,
+						RootCAs:    testCertRoot.Pool(),
+					}), nil
+				}
+
+				assertEchoHTTP(t, listeners[0].FQDN, "", dial)
+			},
+		},
+		{
+			name: "app_capabilities",
+			modes: []ServiceMode{
+				ServiceModeHTTP{
+					Port: 80,
+					AcceptAppCaps: map[string][]string{
+						"/":    {"example.com/cap/all-paths"},
+						"/foo": {"example.com/cap/all-paths", "example.com/cap/foo"},
+					},
+				},
+			},
+			extraSetup: func(t *testing.T, control *testcontrol.Server) {
+				control.SetGlobalAppCaps(tailcfg.PeerCapMap{
+					"example.com/cap/all-paths": []tailcfg.RawMessage{`true`},
+					"example.com/cap/foo":       []tailcfg.RawMessage{`true`},
+				})
+			},
+			run: func(t *testing.T, listeners []*ServiceListener, peer *Server) {
+				allPathsCap := "example.com/cap/all-paths"
+				fooCap := "example.com/cap/foo"
+				checkCaps := func(r *http.Request) {
+					rawCaps, ok := r.Header["Tailscale-App-Capabilities"]
+					if !ok {
+						t.Error("no app capabilities header")
+						return
+					}
+					if len(rawCaps) != 1 {
+						t.Error("expected one app capabilities header value, got", len(rawCaps))
+						return
+					}
+					var caps map[string][]any
+					if err := json.Unmarshal([]byte(rawCaps[0]), &caps); err != nil {
+						t.Error("error unmarshaling app caps:", err)
+						return
+					}
+					if _, ok := caps[allPathsCap]; !ok {
+						t.Errorf("got app caps, but %v is not present; saw:\n%v", allPathsCap, caps)
+					}
+					if strings.HasPrefix(r.URL.Path, "/foo") {
+						if _, ok := caps[fooCap]; !ok {
+							t.Errorf("%v should be present for /foo request; saw:\n%v", fooCap, caps)
+						}
+					} else {
+						if _, ok := caps[fooCap]; ok {
+							t.Errorf("%v should not be present for non-/foo request; saw:\n%v", fooCap, caps)
+						}
+					}
+				}
+
+				go checkAndEcho(t, listeners[0], checkCaps)
+				assertEchoHTTP(t, listeners[0].FQDN, "", peer.Dial)
+				assertEchoHTTP(t, listeners[0].FQDN, "/foo", peer.Dial)
+				assertEchoHTTP(t, listeners[0].FQDN, "/foo/bar", peer.Dial)
+			},
+		},
+		{
+			name: "multiple_ports",
+			modes: []ServiceMode{
+				ServiceModeTCP{
+					Port: 99,
+				},
+				ServiceModeHTTP{
+					Port: 80,
+				},
+			},
+			run: func(t *testing.T, listeners []*ServiceListener, peer *Server) {
+				go acceptAndEcho(t, listeners[0])
+
+				target := fmt.Sprintf("%s:%d", listeners[0].FQDN, 99)
+				conn := must.Get(peer.Dial(t.Context(), "tcp", target))
+				defer conn.Close()
+				assertEcho(t, conn)
+
+				go checkAndEcho(t, listeners[1], nil)
+				assertEchoHTTP(t, listeners[1].FQDN, "", peer.Dial)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		// Overview:
+		// - start test control
+		// - start 2 tsnet nodes:
+		//     one to act as Service host and a second to act as a peer client
+		// - configure necessary state on control mock
+		// - start a Service listener from the host
+		// - call tt.run with our test bed
+		//
+		// This ends up also testing the Service forwarding logic in
+		// LocalBackend, but that's useful too.
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := t.Context()
+
+			controlURL, control := startControl(t)
+			serviceHost, _, _ := startServer(t, ctx, controlURL, "service-host")
+			serviceClient, _, _ := startServer(t, ctx, controlURL, "service-client")
+
+			const serviceName = tailcfg.ServiceName("svc:foo")
+			const serviceVIP = "100.11.22.33"
+
+			// == Set up necessary state in our mock ==
+
+			// The Service host must have the 'service-host' capability, which
+			// is a mapping from the Service name to the Service VIP.
+			var serviceHostCaps map[tailcfg.ServiceName]views.Slice[netip.Addr]
+			mak.Set(&serviceHostCaps, serviceName, views.SliceOf([]netip.Addr{netip.MustParseAddr(serviceVIP)}))
+			j := must.Get(json.Marshal(serviceHostCaps))
+			cm := serviceHost.lb.NetMap().SelfNode.CapMap().AsMap()
+			mak.Set(&cm, tailcfg.NodeAttrServiceHost, []tailcfg.RawMessage{tailcfg.RawMessage(j)})
+			control.SetNodeCapMap(serviceHost.lb.NodeKey(), cm)
+
+			// The Service host must be allowed to advertise the Service VIP.
+			control.SetSubnetRoutes(serviceHost.lb.NodeKey(), []netip.Prefix{
+				netip.MustParsePrefix(serviceVIP + `/32`),
+			})
+
+			// The Service host must be a tagged node (any tag will do).
+			serviceHostNode := control.Node(serviceHost.lb.NodeKey())
+			serviceHostNode.Tags = append(serviceHostNode.Tags, "some-tag")
+			control.UpdateNode(serviceHostNode)
+
+			// The service client must accept routes advertised by other nodes
+			// (RouteAll is equivalent to --accept-routes).
+			must.Get(serviceClient.localClient.EditPrefs(ctx, &ipn.MaskedPrefs{
+				RouteAllSet: true,
+				Prefs: ipn.Prefs{
+					RouteAll: true,
+				},
+			}))
+
+			// Set up DNS for our Service.
+			control.AddDNSRecords(tailcfg.DNSRecord{
+				Name:  serviceName.WithoutPrefix() + "." + control.MagicDNSDomain,
+				Value: serviceVIP,
+			})
+
+			if tt.extraSetup != nil {
+				tt.extraSetup(t, control)
+			}
+
+			// Force netmap updates to avoid race conditions. The nodes need to
+			// see our control updates before we can start the test.
+			must.Do(control.ForceNetmapUpdate(ctx, serviceHost.lb.NodeKey()))
+			must.Do(control.ForceNetmapUpdate(ctx, serviceClient.lb.NodeKey()))
+			netmapUpToDate := func(s *Server) bool {
+				nm := s.lb.NetMap()
+				return slices.ContainsFunc(nm.DNS.ExtraRecords, func(r tailcfg.DNSRecord) bool {
+					return r.Value == serviceVIP
+				})
+			}
+			for !netmapUpToDate(serviceClient) {
+				time.Sleep(10 * time.Millisecond)
+			}
+			for !netmapUpToDate(serviceHost) {
+				time.Sleep(10 * time.Millisecond)
+			}
+
+			// == Done setting up mock state ==
+
+			// Start the Service listeners.
+			listeners := make([]*ServiceListener, 0, len(tt.modes))
+			for _, input := range tt.modes {
+				ln := must.Get(serviceHost.ListenService(serviceName.String(), input))
+				defer ln.Close()
+				listeners = append(listeners, ln)
+			}
+
+			tt.run(t, listeners, serviceClient)
+		})
 	}
 }
 
@@ -1392,4 +1871,242 @@ func TestDeps(t *testing.T) {
 			}
 		},
 	}.Check(t)
+}
+
+func TestResolveAuthKey(t *testing.T) {
+	tests := []struct {
+		name            string
+		authKey         string
+		clientSecret    string
+		clientID        string
+		idToken         string
+		audience        string
+		oauthAvailable  bool
+		wifAvailable    bool
+		resolveViaOAuth func(ctx context.Context, clientSecret string, tags []string) (string, error)
+		resolveViaWIF   func(ctx context.Context, baseURL, clientID, idToken, audience string, tags []string) (string, error)
+		wantAuthKey     string
+		wantErr         bool
+		wantErrContains string
+	}{
+		{
+			name:           "successful resolution via OAuth client secret",
+			clientSecret:   "tskey-client-secret-123",
+			oauthAvailable: true,
+			resolveViaOAuth: func(ctx context.Context, clientSecret string, tags []string) (string, error) {
+				if clientSecret != "tskey-client-secret-123" {
+					return "", fmt.Errorf("unexpected client secret: %s", clientSecret)
+				}
+				return "tskey-auth-via-oauth", nil
+			},
+			wantAuthKey:     "tskey-auth-via-oauth",
+			wantErrContains: "",
+		},
+		{
+			name:           "failing resolution via OAuth client secret",
+			clientSecret:   "tskey-client-secret-123",
+			oauthAvailable: true,
+			resolveViaOAuth: func(ctx context.Context, clientSecret string, tags []string) (string, error) {
+				return "", fmt.Errorf("resolution failed")
+			},
+			wantErrContains: "resolution failed",
+		},
+		{
+			name:         "successful resolution via federated ID token",
+			clientID:     "client-id-123",
+			idToken:      "id-token-456",
+			wifAvailable: true,
+			resolveViaWIF: func(ctx context.Context, baseURL, clientID, idToken, audience string, tags []string) (string, error) {
+				if clientID != "client-id-123" {
+					return "", fmt.Errorf("unexpected client ID: %s", clientID)
+				}
+				if idToken != "id-token-456" {
+					return "", fmt.Errorf("unexpected ID token: %s", idToken)
+				}
+				return "tskey-auth-via-wif", nil
+			},
+			wantAuthKey:     "tskey-auth-via-wif",
+			wantErrContains: "",
+		},
+		{
+			name:         "successful resolution via federated audience",
+			clientID:     "client-id-123",
+			audience:     "api.tailscale.com",
+			wifAvailable: true,
+			resolveViaWIF: func(ctx context.Context, baseURL, clientID, idToken, audience string, tags []string) (string, error) {
+				if clientID != "client-id-123" {
+					return "", fmt.Errorf("unexpected client ID: %s", clientID)
+				}
+				if audience != "api.tailscale.com" {
+					return "", fmt.Errorf("unexpected ID token: %s", idToken)
+				}
+				return "tskey-auth-via-wif", nil
+			},
+			wantAuthKey:     "tskey-auth-via-wif",
+			wantErrContains: "",
+		},
+		{
+			name:         "failing resolution via federated ID token",
+			clientID:     "client-id-123",
+			idToken:      "id-token-456",
+			wifAvailable: true,
+			resolveViaWIF: func(ctx context.Context, baseURL, clientID, idToken, audience string, tags []string) (string, error) {
+				return "", fmt.Errorf("resolution failed")
+			},
+			wantErrContains: "resolution failed",
+		},
+		{
+			name:         "empty client ID with ID token",
+			clientID:     "",
+			idToken:      "id-token-456",
+			wifAvailable: true,
+			resolveViaWIF: func(ctx context.Context, baseURL, clientID, idToken, audience string, tags []string) (string, error) {
+				return "", fmt.Errorf("should not be called")
+			},
+			wantErrContains: "empty",
+		},
+		{
+			name:         "empty client ID with audience",
+			clientID:     "",
+			audience:     "api.tailscale.com",
+			wifAvailable: true,
+			resolveViaWIF: func(ctx context.Context, baseURL, clientID, idToken, audience string, tags []string) (string, error) {
+				return "", fmt.Errorf("should not be called")
+			},
+			wantErrContains: "empty",
+		},
+		{
+			name:         "empty ID token",
+			clientID:     "client-id-123",
+			idToken:      "",
+			wifAvailable: true,
+			resolveViaWIF: func(ctx context.Context, baseURL, clientID, idToken, audience string, tags []string) (string, error) {
+				return "", fmt.Errorf("should not be called")
+			},
+			wantErrContains: "empty",
+		},
+		{
+			name:         "audience with ID token",
+			clientID:     "client-id-123",
+			idToken:      "id-token-456",
+			audience:     "api.tailscale.com",
+			wifAvailable: true,
+			resolveViaWIF: func(ctx context.Context, baseURL, clientID, idToken, audience string, tags []string) (string, error) {
+				return "", fmt.Errorf("should not be called")
+			},
+			wantErrContains: "only one of ID token and audience",
+		},
+		{
+			name:           "workload identity resolution skipped if resolution via OAuth token succeeds",
+			clientSecret:   "tskey-client-secret-123",
+			oauthAvailable: true,
+			resolveViaOAuth: func(ctx context.Context, clientSecret string, tags []string) (string, error) {
+				if clientSecret != "tskey-client-secret-123" {
+					return "", fmt.Errorf("unexpected client secret: %s", clientSecret)
+				}
+				return "tskey-auth-via-oauth", nil
+			},
+			wifAvailable: true,
+			resolveViaWIF: func(ctx context.Context, baseURL, clientID, idToken, audience string, tags []string) (string, error) {
+				return "", fmt.Errorf("should not be called")
+			},
+			wantAuthKey:     "tskey-auth-via-oauth",
+			wantErrContains: "",
+		},
+		{
+			name:           "workload identity resolution skipped if resolution via OAuth token fails",
+			clientID:       "tskey-client-id-123",
+			idToken:        "",
+			oauthAvailable: true,
+			resolveViaOAuth: func(ctx context.Context, clientSecret string, tags []string) (string, error) {
+				return "", fmt.Errorf("resolution failed")
+			},
+			wifAvailable: true,
+			resolveViaWIF: func(ctx context.Context, baseURL, clientID, idToken, audience string, tags []string) (string, error) {
+				return "", fmt.Errorf("should not be called")
+			},
+			wantErrContains: "failed",
+		},
+		{
+			name:            "authkey set and no resolution available",
+			authKey:         "tskey-auth-123",
+			oauthAvailable:  false,
+			wifAvailable:    false,
+			wantAuthKey:     "tskey-auth-123",
+			wantErrContains: "",
+		},
+		{
+			name:            "no authkey set and no resolution available",
+			oauthAvailable:  false,
+			wifAvailable:    false,
+			wantAuthKey:     "",
+			wantErrContains: "",
+		},
+		{
+			name:           "authkey is client secret and resolution via OAuth client secret succeeds",
+			authKey:        "tskey-client-secret-123",
+			oauthAvailable: true,
+			resolveViaOAuth: func(ctx context.Context, clientSecret string, tags []string) (string, error) {
+				if clientSecret != "tskey-client-secret-123" {
+					return "", fmt.Errorf("unexpected client secret: %s", clientSecret)
+				}
+				return "tskey-auth-via-oauth", nil
+			},
+			wantAuthKey:     "tskey-auth-via-oauth",
+			wantErrContains: "",
+		},
+		{
+			name:           "authkey is client secret but resolution via OAuth client secret fails",
+			authKey:        "tskey-client-secret-123",
+			oauthAvailable: true,
+			resolveViaOAuth: func(ctx context.Context, clientSecret string, tags []string) (string, error) {
+				return "", fmt.Errorf("resolution failed")
+			},
+			wantErrContains: "resolution failed",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.oauthAvailable {
+				t.Cleanup(tailscale.HookResolveAuthKey.SetForTest(tt.resolveViaOAuth))
+			}
+
+			if tt.wifAvailable {
+				t.Cleanup(tailscale.HookResolveAuthKeyViaWIF.SetForTest(tt.resolveViaWIF))
+			}
+
+			s := &Server{
+				AuthKey:      tt.authKey,
+				ClientSecret: tt.clientSecret,
+				ClientID:     tt.clientID,
+				IDToken:      tt.idToken,
+				Audience:     tt.audience,
+				ControlURL:   "https://control.example.com",
+			}
+			s.shutdownCtx = context.Background()
+
+			gotAuthKey, err := s.resolveAuthKey()
+
+			if tt.wantErrContains != "" {
+				if err == nil {
+					t.Errorf("expected error but got none")
+					return
+				}
+				if !strings.Contains(err.Error(), tt.wantErrContains) {
+					t.Errorf("expected error containing %q but got error: %v", tt.wantErrContains, err)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Errorf("resolveAuthKey expected no error but got error: %v", err)
+				return
+			}
+
+			if gotAuthKey != tt.wantAuthKey {
+				t.Errorf("resolveAuthKey() = %q, want %q", gotAuthKey, tt.wantAuthKey)
+			}
+		})
+	}
 }

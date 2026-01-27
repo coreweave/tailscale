@@ -404,6 +404,7 @@ func run() (err error) {
 	// Install an event bus as early as possible, so that it's
 	// available universally when setting up everything else.
 	sys := tsd.NewSystem()
+	sys.SocketPath = args.socketpath
 
 	// Parse config, if specified, to fail early if it's invalid.
 	var conf *conffile.Config
@@ -774,7 +775,7 @@ func tryEngine(logf logger.Logf, sys *tsd.System, name string) (onlyNetstack boo
 			// configuration being unavailable (from the noop
 			// manager). More in Issue 4017.
 			// TODO(bradfitz): add a Synology-specific DNS manager.
-			conf.DNS, err = dns.NewOSConfigurator(logf, sys.HealthTracker.Get(), sys.PolicyClientOrDefault(), sys.ControlKnobs(), "") // empty interface name
+			conf.DNS, err = dns.NewOSConfigurator(logf, sys.HealthTracker.Get(), sys.Bus.Get(), sys.PolicyClientOrDefault(), sys.ControlKnobs(), "") // empty interface name
 			if err != nil {
 				return false, fmt.Errorf("dns.NewOSConfigurator: %w", err)
 			}
@@ -798,8 +799,9 @@ func tryEngine(logf logger.Logf, sys *tsd.System, name string) (onlyNetstack boo
 
 		if runtime.GOOS == "plan9" {
 			// TODO(bradfitz): why don't we do this on all platforms?
+			// TODO(barnstar): we do it on sandboxed darwin now
 			// We should. Doing it just on plan9 for now conservatively.
-			sys.NetMon.Get().SetTailscaleInterfaceName(devName)
+			netmon.SetTailscaleInterfaceProps(devName, 0)
 		}
 
 		r, err := router.New(logf, dev, sys.NetMon.Get(), sys.HealthTracker.Get(), sys.Bus.Get())
@@ -808,7 +810,7 @@ func tryEngine(logf logger.Logf, sys *tsd.System, name string) (onlyNetstack boo
 			return false, fmt.Errorf("creating router: %w", err)
 		}
 
-		d, err := dns.NewOSConfigurator(logf, sys.HealthTracker.Get(), sys.PolicyClientOrDefault(), sys.ControlKnobs(), devName)
+		d, err := dns.NewOSConfigurator(logf, sys.HealthTracker.Get(), sys.Bus.Get(), sys.PolicyClientOrDefault(), sys.ControlKnobs(), devName)
 		if err != nil {
 			dev.Close()
 			r.Close()
