@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package localapi contains the HTTP server handlers for tailscaled's API server.
@@ -28,13 +28,13 @@ import (
 	"tailscale.com/envknob"
 	"tailscale.com/feature"
 	"tailscale.com/feature/buildfeatures"
-	"tailscale.com/health/healthmsg"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnauth"
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/logtail"
+	"tailscale.com/net/neterror"
 	"tailscale.com/net/netns"
 	"tailscale.com/net/netutil"
 	"tailscale.com/tailcfg"
@@ -98,9 +98,6 @@ func init() {
 		Register("check-ip-forwarding", (*Handler).serveCheckIPForwarding)
 		Register("check-udp-gro-forwarding", (*Handler).serveCheckUDPGROForwarding)
 		Register("set-udp-gro-forwarding", (*Handler).serveSetUDPGROForwarding)
-	}
-	if buildfeatures.HasUseExitNode && runtime.GOOS == "linux" {
-		Register("check-reverse-path-filtering", (*Handler).serveCheckReversePathFiltering)
 	}
 	if buildfeatures.HasClientMetrics {
 		Register("upload-client-metrics", (*Handler).serveUploadClientMetrics)
@@ -779,32 +776,6 @@ func (h *Handler) serveCheckSOMarkInUse(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
-func (h *Handler) serveCheckReversePathFiltering(w http.ResponseWriter, r *http.Request) {
-	if !h.PermitRead {
-		http.Error(w, "reverse path filtering check access denied", http.StatusForbidden)
-		return
-	}
-	var warning string
-
-	state := h.b.Sys().NetMon.Get().InterfaceState()
-	warn, err := netutil.CheckReversePathFiltering(state)
-	if err == nil && len(warn) > 0 {
-		var msg strings.Builder
-		msg.WriteString(healthmsg.WarnExitNodeUsage + ":\n")
-		for _, w := range warn {
-			msg.WriteString("- " + w + "\n")
-		}
-		msg.WriteString(healthmsg.DisableRPFilter)
-		warning = msg.String()
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(struct {
-		Warning string
-	}{
-		Warning: warning,
-	})
-}
-
 func (h *Handler) serveCheckUDPGROForwarding(w http.ResponseWriter, r *http.Request) {
 	if !h.PermitRead {
 		http.Error(w, "UDP GRO forwarding check access denied", http.StatusForbidden)
@@ -913,7 +884,9 @@ func (h *Handler) serveWatchIPNBus(w http.ResponseWriter, r *http.Request) {
 	h.b.WatchNotificationsAs(ctx, h.Actor, mask, f.Flush, func(roNotify *ipn.Notify) (keepGoing bool) {
 		err := enc.Encode(roNotify)
 		if err != nil {
-			h.logf("json.Encode: %v", err)
+			if !neterror.IsClosedPipeError(err) {
+				h.logf("json.Encode: %v", err)
+			}
 			return false
 		}
 		f.Flush()

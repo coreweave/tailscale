@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package e2e runs end-to-end tests for the Tailscale Kubernetes operator.
@@ -24,5 +24,5 @@
 //
 // * go
 // * container runtime with the docker daemon API available
-// * devcontrol: ./tool/go run ./cmd/devcontrol --generate-test-devices=k8s-operator-e2e --scenario-output-dir=/tmp/k8s-operator-e2e --test-dns=http://localhost:8055
+// * devcontrol: ./tool/go run --tags=tailscale_saas ./cmd/devcontrol --generate-test-devices=k8s-operator-e2e --scenario-output-dir=/tmp/k8s-operator-e2e --test-dns=http://localhost:8055
 package e2e

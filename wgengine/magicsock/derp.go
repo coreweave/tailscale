@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package magicsock
@@ -436,7 +436,14 @@ func (c *Conn) derpWriteChanForRegion(regionID int, peer key.NodePublic) chan de
 
 	go c.runDerpReader(ctx, regionID, dc, wg, startGate)
 	go c.runDerpWriter(ctx, dc, ch, wg, startGate)
-	go c.derpActiveFunc()
+	go func() {
+		select {
+		case <-ctx.Done():
+			return
+		case <-startGate:
+			c.derpActiveFunc()
+		}
+	}()
 
 	return ad.writeCh
 }

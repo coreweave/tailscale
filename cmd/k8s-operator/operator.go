@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !plan9
@@ -20,6 +20,7 @@ import (
 	"github.com/go-logr/zapr"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+	"golang.org/x/time/rate"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
@@ -54,6 +55,8 @@ import (
 	"tailscale.com/ipn/store/kubestore"
 	apiproxy "tailscale.com/k8s-operator/api-proxy"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
+	"tailscale.com/k8s-operator/reconciler/proxygrouppolicy"
+	"tailscale.com/k8s-operator/reconciler/tailnet"
 	"tailscale.com/kube/kubetypes"
 	"tailscale.com/tsnet"
 	"tailscale.com/tstime"
@@ -325,6 +328,25 @@ func runReconcilers(opts reconcilerOpts) {
 		startlog.Fatalf("could not create manager: %v", err)
 	}
 
+	tailnetOptions := tailnet.ReconcilerOptions{
+		Client:             mgr.GetClient(),
+		TailscaleNamespace: opts.tailscaleNamespace,
+		Clock:              tstime.DefaultClock{},
+		Logger:             opts.log,
+	}
+
+	if err = tailnet.NewReconciler(tailnetOptions).Register(mgr); err != nil {
+		startlog.Fatalf("could not register tailnet reconciler: %v", err)
+	}
+
+	proxyGroupPolicyOptions := proxygrouppolicy.ReconcilerOptions{
+		Client: mgr.GetClient(),
+	}
+
+	if err = proxygrouppolicy.NewReconciler(proxyGroupPolicyOptions).Register(mgr); err != nil {
+		startlog.Fatalf("could not register proxygrouppolicy reconciler: %v", err)
+	}
+
 	svcFilter := handler.EnqueueRequestsFromMapFunc(serviceHandler)
 	svcChildFilter := handler.EnqueueRequestsFromMapFunc(managedResourceHandlerForType("svc"))
 	// If a ProxyClass changes, enqueue all Services labeled with that
@@ -420,7 +442,6 @@ func runReconcilers(opts reconcilerOpts) {
 			defaultTags:      strings.Split(opts.proxyTags, ","),
 			Client:           mgr.GetClient(),
 			logger:           opts.log.Named("ingress-pg-reconciler"),
-			lc:               lc,
 			operatorID:       id,
 			tsNamespace:      opts.tailscaleNamespace,
 			ingressClassName: opts.ingressClassName,
@@ -446,7 +467,6 @@ func runReconcilers(opts reconcilerOpts) {
 			defaultTags: strings.Split(opts.proxyTags, ","),
 			Client:      mgr.GetClient(),
 			logger:      opts.log.Named("service-pg-reconciler"),
-			lc:          lc,
 			clock:       tstime.DefaultClock{},
 			operatorID:  id,
 			tsNamespace: opts.tailscaleNamespace,
@@ -665,7 +685,6 @@ func runReconcilers(opts reconcilerOpts) {
 			logger:      opts.log.Named("kube-apiserver-ts-service-reconciler"),
 			tsClient:    opts.tsClient,
 			tsNamespace: opts.tailscaleNamespace,
-			lc:          lc,
 			defaultTags: strings.Split(opts.proxyTags, ","),
 			operatorID:  id,
 			clock:       tstime.DefaultClock{},
@@ -705,6 +724,8 @@ func runReconcilers(opts reconcilerOpts) {
 			tsFirewallMode:    opts.proxyFirewallMode,
 			defaultProxyClass: opts.defaultProxyClass,
 			loginServer:       opts.tsServer.ControlURL,
+			authKeyRateLimits: make(map[string]*rate.Limiter),
+			authKeyReissuing:  make(map[string]bool),
 		})
 	if err != nil {
 		startlog.Fatalf("could not create ProxyGroup reconciler: %v", err)

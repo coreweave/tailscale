@@ -1,5 +1,5 @@
 #!/bin/sh
-# Copyright (c) Tailscale Inc & AUTHORS
+# Copyright (c) Tailscale Inc & contributors
 # SPDX-License-Identifier: BSD-3-Clause
 #
 # This script detects the current operating system, and installs
@@ -341,6 +341,11 @@ main() {
 				echo "https://github.com/tailscale-dev/deck-tailscale"
 				exit 1
 				;;
+			kde-linux)
+				echo "The maintainers of KDE Linux provide documentation on multiple ways to install Tailscale. These instructions are not officially supported by Tailscale:"
+				echo "https://kde.org/linux/docs/more-software/#tailscale"
+				exit 1
+				;;
 
 			# TODO: wsl?
 			# TODO: synology? qnap?
@@ -603,7 +608,7 @@ main() {
 				$SUDO dnf config-manager --add-repo "https://pkgs.tailscale.com/$TRACK/$OS/$VERSION/tailscale.repo"
 			elif [ "$DNF_VERSION" = "5" ]; then
 				# Already installed config-manager, above.
-				$SUDO dnf config-manager addrepo --from-repofile="https://pkgs.tailscale.com/$TRACK/$OS/$VERSION/tailscale.repo"
+				$SUDO dnf config-manager addrepo --overwrite --from-repofile="https://pkgs.tailscale.com/$TRACK/$OS/$VERSION/tailscale.repo"
 			else
 				echo "unexpected: unknown dnf version $DNF_VERSION"
 				exit 1

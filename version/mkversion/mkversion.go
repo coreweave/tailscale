@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package mkversion gets version info from git and provides a bunch of
@@ -384,7 +384,7 @@ func infoFromCache(ref string, runner dirRunner) (verInfo, error) {
 	}
 	changeCount, err := strconv.Atoi(s)
 	if err != nil {
-		return verInfo{}, fmt.Errorf("infoFromCache: parsing changeCount %q: %w", changeCount, err)
+		return verInfo{}, fmt.Errorf("infoFromCache: parsing changeCount %q: %w", s, err)
 	}
 
 	return verInfo{
