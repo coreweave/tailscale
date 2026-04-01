@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package monitor provides facilities for monitoring network
@@ -201,12 +201,7 @@ func (cd *ChangeDelta) AnyInterfaceUp() bool {
 	if cd.new == nil {
 		return false
 	}
-	for _, ifi := range cd.new.Interface {
-		if ifi.IsUp() {
-			return true
-		}
-	}
-	return false
+	return cd.new.AnyInterfaceUp()
 }
 
 // isInterestingInterfaceChange reports whether any interfaces have changed in a meaningful way.

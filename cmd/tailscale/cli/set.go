@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package cli
@@ -193,9 +193,7 @@ func runSet(ctx context.Context, args []string) (retErr error) {
 	}
 
 	warnOnAdvertiseRoutes(ctx, &maskedPrefs.Prefs)
-	if err := checkExitNodeRisk(ctx, &maskedPrefs.Prefs, setArgs.acceptedRisks); err != nil {
-		return err
-	}
+
 	var advertiseExitNodeSet, advertiseRoutesSet bool
 	setFlagSet.Visit(func(f *flag.Flag) {
 		updateMaskedPrefsFromUpOrSetFlag(maskedPrefs, f.Name)
