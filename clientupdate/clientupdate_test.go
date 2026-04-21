@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package clientupdate
@@ -6,9 +6,12 @@ package clientupdate
 import (
 	"archive/tar"
 	"compress/gzip"
+	"encoding/json"
 	"fmt"
 	"io/fs"
 	"maps"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
@@ -86,18 +89,8 @@ func TestUpdateDebianAptSourcesListBytes(t *testing.T) {
 	}
 }
 
-func TestUpdateYUMRepoTrack(t *testing.T) {
-	tests := []struct {
-		desc    string
-		before  string
-		track   string
-		after   string
-		rewrote bool
-		wantErr bool
-	}{
-		{
-			desc: "same track",
-			before: `
+var YUMRepos = map[string]string{
+	StableTrack: `
 [tailscale-stable]
 name=Tailscale stable
 baseurl=https://pkgs.tailscale.com/stable/fedora/$basearch
@@ -107,32 +100,8 @@ repo_gpgcheck=1
 gpgcheck=0
 gpgkey=https://pkgs.tailscale.com/stable/fedora/repo.gpg
 `,
-			track: StableTrack,
-			after: `
-[tailscale-stable]
-name=Tailscale stable
-baseurl=https://pkgs.tailscale.com/stable/fedora/$basearch
-enabled=1
-type=rpm
-repo_gpgcheck=1
-gpgcheck=0
-gpgkey=https://pkgs.tailscale.com/stable/fedora/repo.gpg
-`,
-		},
-		{
-			desc: "change track",
-			before: `
-[tailscale-stable]
-name=Tailscale stable
-baseurl=https://pkgs.tailscale.com/stable/fedora/$basearch
-enabled=1
-type=rpm
-repo_gpgcheck=1
-gpgcheck=0
-gpgkey=https://pkgs.tailscale.com/stable/fedora/repo.gpg
-`,
-			track: UnstableTrack,
-			after: `
+
+	UnstableTrack: `
 [tailscale-unstable]
 name=Tailscale unstable
 baseurl=https://pkgs.tailscale.com/unstable/fedora/$basearch
@@ -142,11 +111,19 @@ repo_gpgcheck=1
 gpgcheck=0
 gpgkey=https://pkgs.tailscale.com/unstable/fedora/repo.gpg
 `,
-			rewrote: true,
-		},
-		{
-			desc: "non-tailscale repo file",
-			before: `
+
+	ReleaseCandidateTrack: `
+[tailscale-release-candidate]
+name=Tailscale release-candidate
+baseurl=https://pkgs.tailscale.com/release-candidate/fedora/$basearch
+enabled=1
+type=rpm
+repo_gpgcheck=1
+gpgcheck=0
+gpgkey=https://pkgs.tailscale.com/release-candidate/fedora/repo.gpg
+`,
+
+	"FakeRepo": `
 [fedora]
 name=Fedora $releasever - $basearch
 #baseurl=http://download.example/pub/fedora/linux/releases/$releasever/Everything/$basearch/os/
@@ -158,8 +135,41 @@ repo_gpgcheck=0
 type=rpm
 gpgcheck=1
 gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-fedora-$releasever-$basearch
-skip_if_unavailable=False
-`,
+skip_if_unavailable=False`,
+}
+
+func TestUpdateYUMRepoTrack(t *testing.T) {
+	tests := []struct {
+		desc    string
+		before  string
+		track   string
+		after   string
+		rewrote bool
+		wantErr bool
+	}{
+		{
+			desc:   "same track",
+			before: YUMRepos[StableTrack],
+			track:  StableTrack,
+			after:  YUMRepos[StableTrack],
+		},
+		{
+			desc:    "change track",
+			before:  YUMRepos[StableTrack],
+			track:   UnstableTrack,
+			after:   YUMRepos[UnstableTrack],
+			rewrote: true,
+		},
+		{
+			desc:    "change track RC",
+			before:  YUMRepos[StableTrack],
+			track:   ReleaseCandidateTrack,
+			after:   YUMRepos[ReleaseCandidateTrack],
+			rewrote: true,
+		},
+		{
+			desc:    "non-tailscale repo file",
+			before:  YUMRepos["FakeRepo"],
 			track:   StableTrack,
 			wantErr: true,
 		},
@@ -287,6 +297,127 @@ tailscale-1.58.2-r0 installed size:
 			}
 			if got != tt.want {
 				t.Fatalf("got version: %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCheckOutdatedAlpineRepo(t *testing.T) {
+	anyToString := func(a any) string {
+		str, ok := a.(string)
+		if !ok {
+			panic("failed to parse param as string")
+		}
+		return str
+	}
+
+	tests := []struct {
+		name              string
+		fileContent       string
+		latestHTTPVersion string
+		latestApkVersion  string
+		wantHTTPVersion   string
+		wantApkVersion    string
+		wantAlpineVersion string
+		track             string
+	}{
+		{
+			name:              "Up to date",
+			fileContent:       "https://dl-cdn.alpinelinux.org/alpine/v3.20/main",
+			latestHTTPVersion: "1.95.3",
+			latestApkVersion:  "1.95.3",
+			track:             "unstable",
+		},
+		{
+			name:              "Behind unstable",
+			fileContent:       "https://dl-cdn.alpinelinux.org/alpine/v3.20/main",
+			latestHTTPVersion: "1.95.4",
+			latestApkVersion:  "1.95.3",
+			wantHTTPVersion:   "1.95.4",
+			wantApkVersion:    "1.95.3",
+			wantAlpineVersion: "v3.20",
+			track:             "unstable",
+		},
+		{
+			name:              "Behind stable",
+			fileContent:       "https://dl-cdn.alpinelinux.org/alpine/v2.40/main",
+			latestHTTPVersion: "1.94.3",
+			latestApkVersion:  "1.92.1",
+			wantHTTPVersion:   "1.94.3",
+			wantApkVersion:    "1.92.1",
+			wantAlpineVersion: "v2.40",
+			track:             "stable",
+		},
+		{
+			name:              "Nothing in dist file",
+			fileContent:       "",
+			latestHTTPVersion: "1.94.3",
+			latestApkVersion:  "1.92.1",
+			wantHTTPVersion:   "1.94.3",
+			wantApkVersion:    "1.92.1",
+			track:             "stable",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir, err := os.MkdirTemp("", "example")
+			if err != nil {
+				t.Fatalf("error creating temp dir: %v", err)
+			}
+			t.Cleanup(func() { os.RemoveAll(dir) }) // clean up
+
+			file := filepath.Join(dir, "distfile")
+			if err := os.WriteFile(file, []byte(tt.fileContent), 0o666); err != nil {
+				t.Fatalf("error creating dist file: %v", err)
+			}
+
+			testServ := httptest.NewServer(http.HandlerFunc(
+				func(w http.ResponseWriter, _ *http.Request) {
+					version := trackPackages{
+						MSIsVersion:     tt.latestHTTPVersion,
+						MacZipsVersion:  tt.latestHTTPVersion,
+						TarballsVersion: tt.latestHTTPVersion,
+						SPKsVersion:     tt.latestHTTPVersion,
+					}
+					jsonData, err := json.Marshal(version)
+					if err != nil {
+						t.Errorf("failed to marshal version string: %v", err)
+					}
+					w.Header().Set("Content-Type", "application/json")
+					if _, err := w.Write(jsonData); err != nil {
+						t.Errorf("failed to write json blob: %v", err)
+					}
+				},
+			))
+			defer testServ.Close()
+
+			oldEndpoint := tailscaleHTTPEndpoint
+			tailscaleHTTPEndpoint = testServ.URL
+			defer func() { tailscaleHTTPEndpoint = oldEndpoint }()
+
+			var paramLatest string
+			var paramApkVer string
+			var paramAlpineVer string
+			logf := func(_ string, params ...any) {
+				paramLatest = anyToString(params[0])
+				paramApkVer = anyToString(params[1])
+				if len(params) > 2 {
+					paramAlpineVer = anyToString(params[2])
+				}
+			}
+
+			err = checkOutdatedAlpineRepo(logf, []string{file}, tt.latestApkVersion, tt.track)
+			if err != nil {
+				t.Errorf("did not expect error, got: %v", err)
+			}
+			if paramLatest != tt.wantHTTPVersion {
+				t.Errorf("expected HTTP version '%s', got '%s'", tt.wantHTTPVersion, paramLatest)
+			}
+			if paramApkVer != tt.wantApkVersion {
+				t.Errorf("expected APK version '%s', got '%s'", tt.wantApkVersion, paramApkVer)
+			}
+			if paramAlpineVer != tt.wantAlpineVersion {
+				t.Errorf("expected alpine version '%s', got '%s'", tt.wantAlpineVersion, paramAlpineVer)
 			}
 		})
 	}

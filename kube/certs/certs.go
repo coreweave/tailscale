@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package certs implements logic to help multiple Kubernetes replicas share TLS
@@ -53,6 +53,7 @@ func (cm *CertManager) EnsureCertLoops(ctx context.Context, sc *ipn.ServeConfig)
 	currentDomains := make(map[string]bool)
 	const httpsPort = "443"
 	for _, service := range sc.Services {
+		// L7 Web handlers (HA Ingress).
 		for hostPort := range service.Web {
 			domain, port, err := net.SplitHostPort(string(hostPort))
 			if err != nil {
@@ -62,6 +63,12 @@ func (cm *CertManager) EnsureCertLoops(ctx context.Context, sc *ipn.ServeConfig)
 				continue
 			}
 			currentDomains[domain] = true
+		}
+		// L4 TCP handlers with TLS termination (kube-apiserver proxy).
+		for _, handler := range service.TCP {
+			if handler != nil && handler.TerminateTLS != "" {
+				currentDomains[handler.TerminateTLS] = true
+			}
 		}
 	}
 	cm.mu.Lock()

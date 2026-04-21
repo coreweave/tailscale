@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !plan9
@@ -172,6 +172,10 @@ func pgStatefulSet(pg *tsapi.ProxyGroup, namespace, image, tsFirewallMode string
 			{
 				Name:  "TS_KUBE_SECRET",
 				Value: "$(POD_NAME)",
+			},
+			{
+				Name:  "TS_EXPERIMENTAL_SERVICE_AUTO_ADVERTISEMENT",
+				Value: "false",
 			},
 			{
 				// TODO(tomhjp): This is tsrecorder-specific and does nothing. Delete.
