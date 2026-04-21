@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package testcontrol contains a minimal control plane server for testing purposes.
@@ -299,43 +299,6 @@ func (s *Server) addDebugMessage(nodeKeyDst key.NodePublic, msg any) bool {
 	return sendUpdate(oldUpdatesCh, updateDebugInjection)
 }
 
-// ForceNetmapUpdate waits for the node to get stuck in a map poll and then
-// sends the current netmap (which may result in a redundant netmap). The
-// intended use case is ensuring state changes propagate before running tests.
-//
-// This should only be called for nodes connected as streaming clients. Calling
-// this with a non-streaming node will result in non-deterministic behavior.
-//
-// This function cannot guarantee that the node has processed the issued update,
-// so tests should confirm processing by querying the node. By example:
-//
-//	if err := s.ForceNetmapUpdate(node.Key()); err != nil {
-//	// handle error
-//	}
-//	for !updatesPresent(node.NetMap()) {
-//	time.Sleep(10 * time.Millisecond)
-//	}
-func (s *Server) ForceNetmapUpdate(ctx context.Context, nodeKey key.NodePublic) error {
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-		if err := s.AwaitNodeInMapRequest(ctx, nodeKey); err != nil {
-			return fmt.Errorf("waiting for node to poll: %w", err)
-		}
-		mr, err := s.MapResponse(&tailcfg.MapRequest{NodeKey: nodeKey})
-		if err != nil {
-			return fmt.Errorf("generating map response: %w", err)
-		}
-		if s.addDebugMessage(nodeKey, mr) {
-			return nil
-		}
-		// If we failed to send the map response, loop around and try again.
-	}
-}
-
 // Mark the Node key of every node as expired
 func (s *Server) SetExpireAllNodes(expired bool) {
 	s.mu.Lock()
@@ -589,8 +552,9 @@ func (s *Server) SetNodeCapMap(nodeKey key.NodePublic, capMap tailcfg.NodeCapMap
 //	]
 func (s *Server) SetGlobalAppCaps(appCaps tailcfg.PeerCapMap) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.globalAppCaps = appCaps
-	s.mu.Unlock()
+	s.updateLocked("SetGlobalAppCaps", s.nodeIDsLocked(0))
 }
 
 // AddDNSRecords adds records to the server's DNS config.
@@ -601,6 +565,7 @@ func (s *Server) AddDNSRecords(records ...tailcfg.DNSRecord) {
 		s.DNSConfig = new(tailcfg.DNSConfig)
 	}
 	s.DNSConfig.ExtraRecords = append(s.DNSConfig.ExtraRecords, records...)
+	s.updateLocked("AddDNSRecords", s.nodeIDsLocked(0))
 }
 
 // nodeIDsLocked returns the node IDs of all nodes in the server, except
@@ -1110,14 +1075,21 @@ func sendUpdate(dst chan<- updateType, updateType updateType) bool {
 	}
 }
 
-func (s *Server) UpdateNode(n *tailcfg.Node) (peersToUpdate []tailcfg.NodeID) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *Server) updateNodeLocked(n *tailcfg.Node) (peersToUpdate []tailcfg.NodeID) {
 	if n.Key.IsZero() {
 		panic("zero nodekey")
 	}
 	s.nodes[n.Key] = n.Clone()
 	return s.nodeIDsLocked(n.ID)
+}
+
+// UpdateNode updates or adds the input node, then triggers a netmap update for
+// all attached streaming clients.
+func (s *Server) UpdateNode(n *tailcfg.Node) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.updateNodeLocked(n)
+	s.updateLocked("UpdateNode", s.nodeIDsLocked(0))
 }
 
 func (s *Server) incrInServeMap(delta int) {
@@ -1178,7 +1150,9 @@ func (s *Server) serveMap(w http.ResponseWriter, r *http.Request, mkey key.Machi
 				}
 			}
 		}
-		peersToUpdate = s.UpdateNode(node)
+		s.mu.Lock()
+		peersToUpdate = s.updateNodeLocked(node)
+		s.mu.Unlock()
 	}
 
 	nodeID := node.ID
@@ -1327,16 +1301,19 @@ func (s *Server) MapResponse(req *tailcfg.MapRequest) (res *tailcfg.MapResponse,
 
 	s.mu.Lock()
 	nodeCapMap := maps.Clone(s.nodeCapMaps[nk])
+	var dns *tailcfg.DNSConfig
+	if s.DNSConfig != nil {
+		dns = s.DNSConfig.Clone()
+	}
+	magicDNSDomain := s.MagicDNSDomain
 	s.mu.Unlock()
 
 	node.CapMap = nodeCapMap
 	node.Capabilities = append(node.Capabilities, tailcfg.NodeAttrDisableUPnP)
 
 	t := time.Date(2020, 8, 3, 0, 0, 0, 1, time.UTC)
-	dns := s.DNSConfig
-	if dns != nil && s.MagicDNSDomain != "" {
-		dns = dns.Clone()
-		dns.CertDomains = append(dns.CertDomains, node.Hostinfo.Hostname()+"."+s.MagicDNSDomain)
+	if dns != nil && magicDNSDomain != "" {
+		dns.CertDomains = append(dns.CertDomains, node.Hostinfo.Hostname()+"."+magicDNSDomain)
 	}
 
 	res = &tailcfg.MapResponse{
