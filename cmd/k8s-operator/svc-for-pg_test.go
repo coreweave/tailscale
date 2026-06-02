@@ -22,16 +22,15 @@ import (
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"tailscale.com/client/tailscale/v2"
 
 	tsoperator "tailscale.com/k8s-operator"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
+	"tailscale.com/k8s-operator/tsclient"
 	"tailscale.com/kube/ingressservices"
 	"tailscale.com/kube/kubetypes"
 	"tailscale.com/tstest"
-	"tailscale.com/types/ptr"
 	"tailscale.com/util/mak"
-
-	"tailscale.com/tailcfg"
 )
 
 func TestServicePGReconciler(t *testing.T) {
@@ -103,11 +102,11 @@ func TestServicePGReconciler_UpdateHostname(t *testing.T) {
 	verifyTailscaleService(t, ft, fmt.Sprintf("svc:%s", hostname), []string{"do-not-validate"})
 	verifyTailscaledConfig(t, fc, "test-pg", []string{fmt.Sprintf("svc:%s", hostname)})
 
-	_, err := ft.GetVIPService(context.Background(), tailcfg.ServiceName(fmt.Sprintf("svc:default-%s", svc.Name)))
+	_, err := ft.VIPServices().Get(context.Background(), fmt.Sprintf("svc:default-%s", svc.Name))
 	if err == nil {
 		t.Fatalf("svc:default-%s not cleaned up", svc.Name)
 	}
-	if !isErrorTailscaleServiceNotFound(err) {
+	if !tailscale.IsNotFound(err) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -189,7 +188,9 @@ func setupServiceTest(t *testing.T) (*HAServiceReconciler, *corev1.Secret, clien
 		t.Fatal(err)
 	}
 
-	ft := &fakeTSClient{}
+	ft := &fakeTSClient{
+		vipServices: make(map[string]tailscale.VIPService),
+	}
 	zl, err := zap.NewDevelopment()
 	if err != nil {
 		t.Fatal(err)
@@ -198,7 +199,7 @@ func setupServiceTest(t *testing.T) (*HAServiceReconciler, *corev1.Secret, clien
 	cl := tstest.NewClock(tstest.ClockOpts{})
 	svcPGR := &HAServiceReconciler{
 		Client:      fc,
-		tsClient:    ft,
+		clients:     tsclient.NewProvider(ft),
 		clock:       cl,
 		defaultTags: []string{"tag:k8s"},
 		tsNamespace: "operator-ns",
@@ -226,7 +227,7 @@ func TestValidateService(t *testing.T) {
 		Spec: corev1.ServiceSpec{
 			ClusterIP:         "1.2.3.4",
 			Type:              corev1.ServiceTypeLoadBalancer,
-			LoadBalancerClass: ptr.To("tailscale"),
+			LoadBalancerClass: new("tailscale"),
 		},
 	}
 	svc2 := &corev1.Service{
@@ -243,7 +244,7 @@ func TestValidateService(t *testing.T) {
 		Spec: corev1.ServiceSpec{
 			ClusterIP:         "1.2.3.5",
 			Type:              corev1.ServiceTypeLoadBalancer,
-			LoadBalancerClass: ptr.To("tailscale"),
+			LoadBalancerClass: new("tailscale"),
 		},
 	}
 	wantSvc := &corev1.Service{
@@ -276,22 +277,22 @@ func TestServicePGReconciler_MultiCluster(t *testing.T) {
 		if i == 0 {
 			ft = fti
 		} else {
-			pgr.tsClient = ft
+			pgr.clients = tsclient.NewProvider(ft)
 		}
 
 		svc, _ := setupTestService(t, "test-multi-cluster", "", "4.3.2.1", fc, stateSecret)
 		expectReconciled(t, pgr, "default", svc.Name)
 
-		tsSvcs, err := ft.ListVIPServices(context.Background())
+		tsSvcs, err := ft.VIPServices().List(t.Context())
 		if err != nil {
 			t.Fatalf("getting Tailscale Service: %v", err)
 		}
 
-		if len(tsSvcs.VIPServices) != 1 {
-			t.Fatalf("unexpected number of Tailscale Services (%d)", len(tsSvcs.VIPServices))
+		if len(tsSvcs) != 1 {
+			t.Fatalf("unexpected number of Tailscale Services (%d)", len(tsSvcs))
 		}
 
-		for _, svc := range tsSvcs.VIPServices {
+		for _, svc := range tsSvcs {
 			t.Logf("found Tailscale Service with name %q", svc.Name)
 		}
 	}
@@ -323,9 +324,9 @@ func TestIgnoreRegularService(t *testing.T) {
 
 	verifyTailscaledConfig(t, fc, "test-pg", nil)
 
-	tsSvcs, err := ft.ListVIPServices(context.Background())
+	tsSvcs, err := ft.VIPServices().List(t.Context())
 	if err == nil {
-		if len(tsSvcs.VIPServices) > 0 {
+		if len(tsSvcs) > 0 {
 			t.Fatal("unexpected Tailscale Services found")
 		}
 	}
@@ -380,7 +381,7 @@ func setupTestService(t *testing.T, svcName string, hostname string, clusterIP s
 		},
 		Spec: corev1.ServiceSpec{
 			Type:              corev1.ServiceTypeLoadBalancer,
-			LoadBalancerClass: ptr.To("tailscale"),
+			LoadBalancerClass: new("tailscale"),
 			ClusterIP:         clusterIP,
 			ClusterIPs:        []string{clusterIP},
 		},
@@ -400,7 +401,7 @@ func setupTestService(t *testing.T, svcName string, hostname string, clusterIP s
 			{
 				Addresses: []string{"4.3.2.1"},
 				Conditions: discoveryv1.EndpointConditions{
-					Ready: ptr.To(true),
+					Ready: new(true),
 				},
 			},
 		},
