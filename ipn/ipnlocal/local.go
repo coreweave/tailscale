@@ -2960,12 +2960,7 @@ func (b *LocalBackend) updateFilterLocked(prefs ipn.PrefsView) {
 	// Log traffic for Tailscale IPs.
 	logNetsB.AddPrefix(tsaddr.CGNATRange())
 	logNetsB.AddPrefix(tsaddr.TailscaleULARange())
-	for _, prefix := range tsaddr.CGNatOverrideRange() {
-		if prefix.IsValid() {
-			logNetsB.AddPrefix(prefix)
-
-		}
-	}
+	logNetsB.RemovePrefix(tsaddr.ChromeOSVMRange())
 	if haveNetmap {
 		addrs = netMap.GetAddresses()
 		for i := range addrs.Len() {
