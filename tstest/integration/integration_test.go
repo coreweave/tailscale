@@ -50,7 +50,6 @@ import (
 	"tailscale.com/types/key"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/opt"
-	"tailscale.com/types/ptr"
 	"tailscale.com/util/must"
 	"tailscale.com/util/set"
 )
@@ -74,9 +73,7 @@ func TestMain(m *testing.M) {
 // https://github.com/tailscale/tailscale/issues/7894
 func TestTUNMode(t *testing.T) {
 	tstest.Shard(t)
-	if os.Getuid() != 0 {
-		t.Skip("skipping when not root")
-	}
+	tstest.RequireRoot(t)
 	tstest.Parallel(t)
 	env := NewTestEnv(t)
 	env.tunMode = true
@@ -201,23 +198,34 @@ func TestExpectedFeaturesLinked(t *testing.T) {
 }
 
 func TestCollectPanic(t *testing.T) {
-	flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/15865")
 	tstest.Shard(t)
 	tstest.Parallel(t)
 	env := NewTestEnv(t)
 	n := NewTestNode(t, env)
 
-	cmd := exec.Command(env.daemon, "--cleanup")
+	// Wait for the binary to be executable, working around a
+	// mysterious ETXTBSY on GitHub Actions.
+	// See https://github.com/tailscale/tailscale/issues/15868.
+	if err := n.awaitTailscaledRunnable(); err != nil {
+		t.Fatal(err)
+	}
+
+	logsDir := t.TempDir()
+	cmd := exec.Command(env.daemon, "--cleanup", "--statedir="+n.dir)
 	cmd.Env = append(os.Environ(),
 		"TS_PLEASE_PANIC=1",
 		"TS_LOG_TARGET="+n.env.LogCatcherServer.URL,
+		"TS_LOGS_DIR="+logsDir,
 	)
 	got, _ := cmd.CombinedOutput() // we expect it to fail, ignore err
 	t.Logf("initial run: %s", got)
 
 	// Now we run it again, and on start, it will upload the logs to logcatcher.
-	cmd = exec.Command(env.daemon, "--cleanup")
-	cmd.Env = append(os.Environ(), "TS_LOG_TARGET="+n.env.LogCatcherServer.URL)
+	cmd = exec.Command(env.daemon, "--cleanup", "--statedir="+n.dir)
+	cmd.Env = append(os.Environ(),
+		"TS_LOG_TARGET="+n.env.LogCatcherServer.URL,
+		"TS_LOGS_DIR="+logsDir,
+	)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("cleanup failed: %v: %q", err, out)
 	}
@@ -459,83 +467,70 @@ func TestOneNodeUpAuth(t *testing.T) {
 		},
 	} {
 		tstest.Shard(t)
+		t.Run(tt.name, func(t *testing.T) {
+			tstest.Parallel(t)
 
-		for _, useSeamlessKeyRenewal := range []bool{true, false} {
-			name := tt.name
-			if useSeamlessKeyRenewal {
-				name += "-with-seamless"
-			}
-			t.Run(name, func(t *testing.T) {
-				tstest.Parallel(t)
-
-				env := NewTestEnv(t, ConfigureControl(
-					func(control *testcontrol.Server) {
-						if tt.authKey != "" {
-							control.RequireAuthKey = tt.authKey
-						} else {
-							control.RequireAuth = true
-						}
-
-						if tt.requireDeviceApproval {
-							control.RequireMachineAuth = true
-						}
-
-						control.AllNodesSameUser = true
-
-						if useSeamlessKeyRenewal {
-							control.DefaultNodeCapabilities = &tailcfg.NodeCapMap{
-								tailcfg.NodeAttrSeamlessKeyRenewal: []tailcfg.RawMessage{},
-							}
-						}
-					},
-				))
-
-				n1 := NewTestNode(t, env)
-				d1 := n1.StartDaemon()
-				defer d1.MustCleanShutdown(t)
-
-				for i, step := range tt.steps {
-					t.Logf("Running step %d", i)
-					cmdArgs := append(step.args, "--login-server="+env.ControlURL())
-
-					t.Logf("Running command: %s", strings.Join(cmdArgs, " "))
-
-					var authURLCount atomic.Int32
-					var deviceApprovalURLCount atomic.Int32
-
-					handler := &authURLParserWriter{t: t,
-						authURLFn:           completeLogin(t, env.Control, &authURLCount),
-						deviceApprovalURLFn: completeDeviceApproval(t, n1, &deviceApprovalURLCount),
+			env := NewTestEnv(t, ConfigureControl(
+				func(control *testcontrol.Server) {
+					if tt.authKey != "" {
+						control.RequireAuthKey = tt.authKey
+					} else {
+						control.RequireAuth = true
 					}
 
-					cmd := n1.Tailscale(cmdArgs...)
-					cmd.Stdout = handler
-					cmd.Stdout = handler
-					cmd.Stderr = cmd.Stdout
-					if err := cmd.Run(); err != nil {
-						t.Fatalf("up: %v", err)
+					if tt.requireDeviceApproval {
+						control.RequireMachineAuth = true
 					}
 
-					n1.AwaitRunning()
+					control.AllNodesSameUser = true
+				},
+			))
 
-					var wantAuthURLCount int32
-					if step.wantAuthURL {
-						wantAuthURLCount = 1
-					}
-					if n := authURLCount.Load(); n != wantAuthURLCount {
-						t.Errorf("Auth URLs completed = %d; want %d", n, wantAuthURLCount)
-					}
+			n1 := NewTestNode(t, env)
+			d1 := n1.StartDaemon()
+			defer d1.MustCleanShutdown(t)
 
-					var wantDeviceApprovalURLCount int32
-					if step.wantDeviceApprovalURL {
-						wantDeviceApprovalURLCount = 1
-					}
-					if n := deviceApprovalURLCount.Load(); n != wantDeviceApprovalURLCount {
-						t.Errorf("Device approval URLs completed = %d; want %d", n, wantDeviceApprovalURLCount)
-					}
+			for i, step := range tt.steps {
+				t.Logf("Running step %d", i)
+				cmdArgs := append(step.args, "--login-server="+env.ControlURL())
+
+				t.Logf("Running command: %s", strings.Join(cmdArgs, " "))
+
+				var authURLCount atomic.Int32
+				var deviceApprovalURLCount atomic.Int32
+
+				handler := &authURLParserWriter{t: t,
+					authURLFn:           completeLogin(t, env.Control, &authURLCount),
+					deviceApprovalURLFn: completeDeviceApproval(t, n1, &deviceApprovalURLCount),
 				}
-			})
-		}
+
+				cmd := n1.Tailscale(cmdArgs...)
+				cmd.Stdout = handler
+				cmd.Stdout = handler
+				cmd.Stderr = cmd.Stdout
+				if err := cmd.Run(); err != nil {
+					t.Fatalf("up: %v", err)
+				}
+
+				n1.AwaitRunning()
+
+				var wantAuthURLCount int32
+				if step.wantAuthURL {
+					wantAuthURLCount = 1
+				}
+				if n := authURLCount.Load(); n != wantAuthURLCount {
+					t.Errorf("Auth URLs completed = %d; want %d", n, wantAuthURLCount)
+				}
+
+				var wantDeviceApprovalURLCount int32
+				if step.wantDeviceApprovalURL {
+					wantDeviceApprovalURLCount = 1
+				}
+				if n := deviceApprovalURLCount.Load(); n != wantDeviceApprovalURLCount {
+					t.Errorf("Device approval URLs completed = %d; want %d", n, wantDeviceApprovalURLCount)
+				}
+			}
+		})
 	}
 }
 
@@ -730,8 +725,8 @@ func TestConfigFileAuthKey(t *testing.T) {
 	must.Do(os.WriteFile(authKeyFile, fmt.Appendf(nil, "%s\n", authKey), 0666))
 	must.Do(os.WriteFile(n1.configFile, must.Get(json.Marshal(ipn.ConfigVAlpha{
 		Version:   "alpha0",
-		AuthKey:   ptr.To("file:" + authKeyFile),
-		ServerURL: ptr.To(n1.env.ControlServer.URL),
+		AuthKey:   new("file:" + authKeyFile),
+		ServerURL: new(n1.env.ControlServer.URL),
 	})), 0644))
 	d1 := n1.StartDaemon()
 
@@ -1555,9 +1550,7 @@ func testAutoUpdateDefaults(t *testing.T, useCap bool) {
 // https://github.com/tailscale/corp/issues/22511
 func TestDNSOverTCPIntervalResolver(t *testing.T) {
 	tstest.Shard(t)
-	if os.Getuid() != 0 {
-		t.Skip("skipping when not root")
-	}
+	tstest.RequireRoot(t)
 	env := NewTestEnv(t)
 	env.tunMode = true
 	n1 := NewTestNode(t, env)
@@ -1627,9 +1620,7 @@ func TestDNSOverTCPIntervalResolver(t *testing.T) {
 // directions.
 func TestNetstackTCPLoopback(t *testing.T) {
 	tstest.Shard(t)
-	if os.Getuid() != 0 {
-		t.Skip("skipping when not root")
-	}
+	tstest.RequireRoot(t)
 
 	env := NewTestEnv(t)
 	env.tunMode = true
@@ -1674,7 +1665,7 @@ func TestNetstackTCPLoopback(t *testing.T) {
 		defer lis.Close()
 
 		writeFn := func(conn net.Conn) error {
-			for i := 0; i < writeBufIterations; i++ {
+			for range writeBufIterations {
 				toWrite := make([]byte, writeBufSize)
 				var wrote int
 				for {
@@ -1769,9 +1760,7 @@ func TestNetstackTCPLoopback(t *testing.T) {
 // directions.
 func TestNetstackUDPLoopback(t *testing.T) {
 	tstest.Shard(t)
-	if os.Getuid() != 0 {
-		t.Skip("skipping when not root")
-	}
+	tstest.RequireRoot(t)
 
 	env := NewTestEnv(t)
 	env.tunMode = true
@@ -2232,7 +2221,7 @@ func TestC2NDebugNetmap(t *testing.T) {
 	// Send a delta update to n1, marking node 0 as online.
 	env.Control.AddRawMapResponse(nodes[1].Key, &tailcfg.MapResponse{
 		PeersChangedPatch: []*tailcfg.PeerChange{{
-			NodeID: nodes[0].ID, Online: ptr.To(true),
+			NodeID: nodes[0].ID, Online: new(true),
 		}},
 	})
 
@@ -2362,6 +2351,38 @@ func TestTailnetLock(t *testing.T) {
 		}
 		if err := node3.Ping(signing1); err != nil {
 			t.Fatalf("ping node3 -> signing1: expected success, got err: %v", err)
+		}
+	})
+
+	// If you run `tailscale lock (add|remove|revoke-keys)` but don't pass any keys,
+	// we print a helpful error message.
+	//
+	// Regression test for tailscale/tailscale#19130
+	t.Run("no-keys-is-error", func(t *testing.T) {
+		for _, verb := range []string{"add", "remove", "revoke-keys"} {
+			t.Run(verb, func(t *testing.T) {
+				tstest.Shard(t)
+				t.Parallel()
+
+				env := NewTestEnv(t)
+				n1 := NewTestNode(t, env)
+				d1 := n1.StartDaemon()
+				defer d1.MustCleanShutdown(t)
+
+				n1.MustUp()
+				n1.AwaitRunning()
+
+				revokeCmd := n1.Tailscale("lock", verb)
+				out, err := revokeCmd.CombinedOutput()
+				if err == nil {
+					t.Fatal("expected command to fail, but succeeded")
+				}
+				want := "missing argument"
+				got := string(out)
+				if !strings.Contains(string(out), want) {
+					t.Fatalf("expected output to contain %q, got %q", want, got)
+				}
+			})
 		}
 	})
 }

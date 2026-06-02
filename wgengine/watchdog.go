@@ -215,6 +215,10 @@ func (e *watchdogEngine) SetNetworkMap(nm *netmap.NetworkMap) {
 	e.watchdog(SetNetworkMap, func() { e.wrap.SetNetworkMap(nm) })
 }
 
+func (e *watchdogEngine) SetPeerByIPPacketFunc(fn func(netip.Addr) (_ key.NodePublic, ok bool)) {
+	e.wrap.SetPeerByIPPacketFunc(fn)
+}
+
 func (e *watchdogEngine) Ping(ip netip.Addr, pingType tailcfg.PingType, size int, cb func(*ipnstate.PingResult)) {
 	e.watchdog(Ping, func() { e.wrap.Ping(ip, pingType, size, cb) })
 }
@@ -241,4 +245,16 @@ func (e *watchdogEngine) InstallCaptureHook(cb packet.CaptureCallback) {
 
 func (e *watchdogEngine) PeerByKey(pubKey key.NodePublic) (_ wgint.Peer, ok bool) {
 	return e.wrap.PeerByKey(pubKey)
+}
+
+func (e *watchdogEngine) PatchDiscoKey(pub key.NodePublic, disco key.DiscoPublic) {
+	// PatchDiscoKey mirrors the implementation of [controlclient.patchDiscoKeyer ].
+	// It is implemented here to avoid the dependency edge to controlclient, but must be kept
+	// in sync with the original implementation.
+	type patchDiscoKeyer interface {
+		PatchDiscoKey(key.NodePublic, key.DiscoPublic)
+	}
+	if n, ok := e.wrap.(patchDiscoKeyer); ok {
+		n.PatchDiscoKey(pub, disco)
+	}
 }

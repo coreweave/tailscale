@@ -54,13 +54,13 @@ ip rule add -6 pref 5270 table 52
 		want string
 	}{
 		{
-			name: "no config",
+			name: "no-config",
 			in:   nil,
 			want: `
 up` + basic,
 		},
 		{
-			name: "local addr only",
+			name: "local-addr-only",
 			in: &Config{
 				LocalAddrs:    mustCIDRs("100.101.102.103/10"),
 				NetfilterMode: netfilterOff,
@@ -71,7 +71,7 @@ ip addr add 100.101.102.103/10 dev tailscale0` + basic,
 		},
 
 		{
-			name: "addr and routes",
+			name: "addr-and-routes",
 			in: &Config{
 				LocalAddrs:    mustCIDRs("100.101.102.103/10"),
 				Routes:        mustCIDRs("100.100.100.100/32", "192.168.16.0/24"),
@@ -85,7 +85,7 @@ ip route add 192.168.16.0/24 dev tailscale0 table 52` + basic,
 		},
 
 		{
-			name: "addr and routes and subnet routes",
+			name: "addr-routes-and-subnet-routes",
 			in: &Config{
 				LocalAddrs:    mustCIDRs("100.101.102.103/10"),
 				Routes:        mustCIDRs("100.100.100.100/32", "192.168.16.0/24"),
@@ -100,7 +100,7 @@ ip route add 192.168.16.0/24 dev tailscale0 table 52` + basic,
 		},
 
 		{
-			name: "addr and routes and subnet routes with netfilter",
+			name: "addr-routes-subnet-routes-with-netfilter",
 			in: &Config{
 				LocalAddrs:        mustCIDRs("100.101.102.104/10"),
 				Routes:            mustCIDRs("100.100.100.100/32", "10.0.0.0/8"),
@@ -141,7 +141,7 @@ v6/nat/ts-postrouting -m mark --mark 0x40000/0xff0000 -j MASQUERADE
 `,
 		},
 		{
-			name: "addr and routes and subnet routes with netfilter but no stateful filtering",
+			name: "addr-routes-subnet-routes-netfilter-no-stateful",
 			in: &Config{
 				LocalAddrs:        mustCIDRs("100.101.102.104/10"),
 				Routes:            mustCIDRs("100.100.100.100/32", "10.0.0.0/8"),
@@ -180,7 +180,7 @@ v6/nat/ts-postrouting -m mark --mark 0x40000/0xff0000 -j MASQUERADE
 `,
 		},
 		{
-			name: "addr and routes with netfilter",
+			name: "addr-and-routes-with-netfilter",
 			in: &Config{
 				LocalAddrs:    mustCIDRs("100.101.102.104/10"),
 				Routes:        mustCIDRs("100.100.100.100/32", "10.0.0.0/8"),
@@ -215,7 +215,7 @@ v6/nat/POSTROUTING -j ts-postrouting
 		},
 
 		{
-			name: "addr and routes and subnet routes with netfilter but no SNAT",
+			name: "addr-routes-subnet-routes-netfilter-no-SNAT",
 			in: &Config{
 				LocalAddrs:       mustCIDRs("100.101.102.104/10"),
 				Routes:           mustCIDRs("100.100.100.100/32", "10.0.0.0/8"),
@@ -251,7 +251,7 @@ v6/nat/POSTROUTING -j ts-postrouting
 `,
 		},
 		{
-			name: "addr and routes with netfilter",
+			name: "addr-and-routes-with-netfilter-2",
 			in: &Config{
 				LocalAddrs:    mustCIDRs("100.101.102.104/10"),
 				Routes:        mustCIDRs("100.100.100.100/32", "10.0.0.0/8"),
@@ -286,7 +286,7 @@ v6/nat/POSTROUTING -j ts-postrouting
 		},
 
 		{
-			name: "addr and routes with half netfilter",
+			name: "addr-and-routes-with-half-netfilter",
 			in: &Config{
 				LocalAddrs:    mustCIDRs("100.101.102.104/10"),
 				Routes:        mustCIDRs("100.100.100.100/32", "10.0.0.0/8"),
@@ -310,7 +310,7 @@ v6/filter/ts-forward -o tailscale0 -j ACCEPT
 `,
 		},
 		{
-			name: "addr and routes with netfilter2",
+			name: "addr-and-routes-with-netfilter2",
 			in: &Config{
 				LocalAddrs:    mustCIDRs("100.101.102.104/10"),
 				Routes:        mustCIDRs("100.100.100.100/32", "10.0.0.0/8"),
@@ -344,7 +344,7 @@ v6/nat/POSTROUTING -j ts-postrouting
 `,
 		},
 		{
-			name: "addr, routes, and local routes with netfilter",
+			name: "addr-routes-local-routes-with-netfilter",
 			in: &Config{
 				LocalAddrs:    mustCIDRs("100.101.102.104/10"),
 				Routes:        mustCIDRs("100.100.100.100/32", "0.0.0.0/0"),
@@ -380,7 +380,7 @@ v6/nat/POSTROUTING -j ts-postrouting
 `,
 		},
 		{
-			name: "addr, routes, and local routes with no netfilter",
+			name: "addr-routes-local-routes-no-netfilter",
 			in: &Config{
 				LocalAddrs:    mustCIDRs("100.101.102.104/10"),
 				Routes:        mustCIDRs("100.100.100.100/32", "0.0.0.0/0"),
@@ -396,7 +396,7 @@ ip route add throw 10.0.0.0/8 table 52
 ip route add throw 192.168.0.0/24 table 52` + basic,
 		},
 		{
-			name: "subnet routes with connmark for rp_filter",
+			name: "subnet-routes-connmark-for-rp_filter",
 			in: &Config{
 				LocalAddrs:       mustCIDRs("100.101.102.104/10"),
 				Routes:           mustCIDRs("100.100.100.100/32"),
@@ -433,7 +433,7 @@ v6/nat/ts-postrouting -m mark --mark 0x40000/0xff0000 -j MASQUERADE
 `,
 		},
 		{
-			name: "subnet routes (connmark always enabled)",
+			name: "subnet-routes-connmark-always-enabled",
 			in: &Config{
 				LocalAddrs:       mustCIDRs("100.101.102.104/10"),
 				Routes:           mustCIDRs("100.100.100.100/32"),
@@ -470,7 +470,7 @@ v6/nat/ts-postrouting -m mark --mark 0x40000/0xff0000 -j MASQUERADE
 `,
 		},
 		{
-			name: "connmark with stateful filtering",
+			name: "connmark-with-stateful-filtering",
 			in: &Config{
 				LocalAddrs:        mustCIDRs("100.101.102.104/10"),
 				Routes:            mustCIDRs("100.100.100.100/32"),
@@ -562,6 +562,10 @@ type fakeIPTablesRunner struct {
 	ipt4 map[string][]string
 	ipt6 map[string][]string
 	// we always assume ipv6 and ipv6 nat are enabled when testing
+
+	addChainsErr          error // if non-nil, AddChains returns it instead of setting up chains
+	addConnmarkSaveCalls  int
+	addExternalCGNATCalls int
 }
 
 func newIPTablesRunner(t *testing.T) linuxfw.NetfilterRunner {
@@ -717,11 +721,11 @@ func (n *fakeIPTablesRunner) DeleteDNATRuleForSvc(svcName string, origDst, dst n
 	return errors.New("not implemented")
 }
 
+type iptRule struct{ chain, rule string }
+
 func (n *fakeIPTablesRunner) addBase4(tunname string) error {
 	curIPT := n.ipt4
-	newRules := []struct{ chain, rule string }{
-		{"filter/ts-input", fmt.Sprintf("! -i %s -s %s -j RETURN", tunname, tsaddr.ChromeOSVMRange().String())},
-		{"filter/ts-input", fmt.Sprintf("! -i %s -s %s -j DROP", tunname, tsaddr.CGNATRange().String())},
+	newRules := []iptRule{
 		{"filter/ts-forward", fmt.Sprintf("-i %s -j MARK --set-mark %s/%s", tunname, tsconst.LinuxSubnetRouteMark, tsconst.LinuxFwmarkMask)},
 		{"filter/ts-forward", fmt.Sprintf("-m mark --mark %s/%s -j ACCEPT", tsconst.LinuxSubnetRouteMark, tsconst.LinuxFwmarkMask)},
 		{"filter/ts-forward", fmt.Sprintf("-o %s -s %s -j DROP", tunname, tsaddr.CGNATRange().String())},
@@ -737,7 +741,7 @@ func (n *fakeIPTablesRunner) addBase4(tunname string) error {
 
 func (n *fakeIPTablesRunner) addBase6(tunname string) error {
 	curIPT := n.ipt6
-	newRules := []struct{ chain, rule string }{
+	newRules := []iptRule{
 		{"filter/ts-forward", fmt.Sprintf("-i %s -j MARK --set-mark %s/%s", tunname, tsconst.LinuxSubnetRouteMark, tsconst.LinuxFwmarkMask)},
 		{"filter/ts-forward", fmt.Sprintf("-m mark --mark %s/%s -j ACCEPT", tsconst.LinuxSubnetRouteMark, tsconst.LinuxFwmarkMask)},
 		{"filter/ts-forward", fmt.Sprintf("-o %s -j ACCEPT", tunname)},
@@ -762,7 +766,7 @@ func (n *fakeIPTablesRunner) DelLoopbackRule(addr netip.Addr) error {
 }
 
 func (n *fakeIPTablesRunner) AddHooks() error {
-	newRules := []struct{ chain, rule string }{
+	newRules := []iptRule{
 		{"filter/INPUT", "-j ts-input"},
 		{"filter/FORWARD", "-j ts-forward"},
 		{"nat/POSTROUTING", "-j ts-postrouting"},
@@ -778,7 +782,7 @@ func (n *fakeIPTablesRunner) AddHooks() error {
 }
 
 func (n *fakeIPTablesRunner) DelHooks(logf logger.Logf) error {
-	delRules := []struct{ chain, rule string }{
+	delRules := []iptRule{
 		{"filter/INPUT", "-j ts-input"},
 		{"filter/FORWARD", "-j ts-forward"},
 		{"nat/POSTROUTING", "-j ts-postrouting"},
@@ -794,6 +798,9 @@ func (n *fakeIPTablesRunner) DelHooks(logf logger.Logf) error {
 }
 
 func (n *fakeIPTablesRunner) AddChains() error {
+	if n.addChainsErr != nil {
+		return n.addChainsErr
+	}
 	for _, ipt := range []map[string][]string{n.ipt4, n.ipt6} {
 		for _, chain := range []string{"filter/ts-input", "filter/ts-forward", "nat/ts-postrouting"} {
 			ipt[chain] = nil
@@ -922,6 +929,7 @@ func (n *fakeIPTablesRunner) DelMagicsockPortRule(port uint16, network string) e
 }
 
 func (n *fakeIPTablesRunner) AddConnmarkSaveRule() error {
+	n.addConnmarkSaveCalls++
 	// PREROUTING rule: restore mark from conntrack
 	prerouteRule := "-m conntrack --ctstate ESTABLISHED,RELATED -j CONNMARK --restore-mark --nfmask 0xff0000 --ctmask 0xff0000"
 	for _, ipt := range []map[string][]string{n.ipt4, n.ipt6} {
@@ -949,6 +957,49 @@ func (n *fakeIPTablesRunner) DelConnmarkSaveRule() error {
 	outputRule := "-m conntrack --ctstate NEW -m mark ! --mark 0x0/0xff0000 -j CONNMARK --save-mark --nfmask 0xff0000 --ctmask 0xff0000"
 	for _, ipt := range []map[string][]string{n.ipt4, n.ipt6} {
 		deleteRule(n, ipt, "mangle/OUTPUT", outputRule) // ignore errors
+	}
+	return nil
+}
+
+func buildExternalCGNATRules(mode linuxfw.CGNATMode, tunname string) ([]iptRule, error) {
+	switch mode {
+	case linuxfw.CGNATModeDrop:
+		return []iptRule{
+			{"filter/ts-input", fmt.Sprintf("! -i %s -s %s -j RETURN", tunname, tsaddr.ChromeOSVMRange().String())},
+			{"filter/ts-input", fmt.Sprintf("! -i %s -s %s -j DROP", tunname, tsaddr.CGNATRange().String())},
+		}, nil
+	case linuxfw.CGNATModeReturn:
+		return []iptRule{
+			{"filter/ts-input", fmt.Sprintf("! -i %s -s %s -j RETURN", tunname, tsaddr.CGNATRange().String())},
+		}, nil
+	default:
+		return nil, fmt.Errorf("unsupported mode %q", mode)
+	}
+}
+
+func (n *fakeIPTablesRunner) AddExternalCGNATRules(mode linuxfw.CGNATMode, tunname string) error {
+	n.addExternalCGNATCalls++
+	rules, err := buildExternalCGNATRules(mode, tunname)
+	if err != nil {
+		return err
+	}
+	for _, rule := range rules {
+		if err := appendRule(n, n.ipt4, rule.chain, rule.rule); err != nil {
+			return fmt.Errorf("add rule %q to chain %q: %w", rule.rule, rule.chain, err)
+		}
+	}
+	return nil
+}
+
+func (n *fakeIPTablesRunner) DelExternalCGNATRules(mode linuxfw.CGNATMode, tunname string) error {
+	rules, err := buildExternalCGNATRules(mode, tunname)
+	if err != nil {
+		return err
+	}
+	for _, rule := range rules {
+		if err := deleteRule(n, n.ipt4, rule.chain, rule.rule); err != nil {
+			return fmt.Errorf("del rule %q to chain %q: %w", rule.rule, rule.chain, err)
+		}
 	}
 	return nil
 }
@@ -1073,11 +1124,9 @@ func (o *fakeOS) run(args ...string) error {
 
 	switch args[2] {
 	case "add":
-		for _, el := range *ls {
-			if el == rest {
-				o.t.Errorf("can't add %q, already present", rest)
-				return errors.New("already exists")
-			}
+		if slices.Contains(*ls, rest) {
+			o.t.Errorf("can't add %q, already present", rest)
+			return errors.New("already exists")
 		}
 		*ls = append(*ls, rest)
 		sort.Strings(*ls)
@@ -1159,9 +1208,7 @@ func (lt *linuxTest) Close() error {
 }
 
 func newLinuxRootTest(t *testing.T) (*linuxTest, *eventbus.Bus) {
-	if os.Getuid() != 0 {
-		t.Skip("test requires root")
-	}
+	tstest.RequireRoot(t)
 
 	lt := new(linuxTest)
 	lt.tun = createTestTUN(t)
@@ -1213,7 +1260,9 @@ func TestRuleDeletedEvent(t *testing.T) {
 }
 
 func TestDelRouteIdempotent(t *testing.T) {
+	fake := NewFakeOS(t)
 	lt, _ := newLinuxRootTest(t)
+	lt.r.nfr = fake.nfr
 	defer lt.Close()
 
 	for _, s := range []string{
@@ -1239,7 +1288,9 @@ func TestDelRouteIdempotent(t *testing.T) {
 }
 
 func TestAddRemoveRules(t *testing.T) {
+	fake := NewFakeOS(t)
 	lt, _ := newLinuxRootTest(t)
+	lt.r.nfr = fake.nfr
 	defer lt.Close()
 	r := lt.r
 
@@ -1506,5 +1557,55 @@ func TestUpdateMagicsockPortChange(t *testing.T) {
 	if hasOldRule {
 		t.Errorf("firewall rule for OLD port 12345 still exists (should be deleted).\nFound: %s\nAll rules: %v",
 			oldPortRule, nfr.ipt4["filter/ts-input"])
+	}
+}
+
+// TestSetSkipsNetfilterAddonsWhenSetupFails verifies that Set does not invoke
+// rule-management methods that depend on the ts-* chains existing when chain
+// setup failed.
+func TestSetSkipsNetfilterAddonsWhenSetupFails(t *testing.T) {
+	nfr := newIPTablesRunner(t).(*fakeIPTablesRunner)
+	nfr.addChainsErr = errors.New("kernel lacks netfilter support")
+
+	bus := eventbus.New()
+	defer bus.Close()
+	mon, err := netmon.New(bus, logger.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mon.Start()
+	defer mon.Close()
+
+	fake := NewFakeOS(t)
+	ht := health.NewTracker(bus)
+	r, err := newUserspaceRouterAdvanced(logger.Discard, "tailscale0", mon, fake, ht, bus)
+	if err != nil {
+		t.Fatalf("newUserspaceRouterAdvanced: %v", err)
+	}
+	lr := r.(*linuxRouter)
+	lr.nfr = nfr
+	if err := lr.Up(); err != nil {
+		t.Fatalf("Up: %v", err)
+	}
+	defer lr.Close()
+
+	cfg := &Config{
+		LocalAddrs:    mustCIDRs("100.101.102.103/10"),
+		NetfilterMode: netfilterOn,
+	}
+	// Set must return an error (chain setup failed) but must not panic.
+	if err := lr.Set(cfg); err == nil {
+		t.Fatal("Set returned nil; want error because AddChains failed")
+	}
+	if lr.netfilterMode != netfilterOff {
+		t.Errorf("netfilterMode = %v; want netfilterOff after failed AddChains", lr.netfilterMode)
+	}
+	if nfr.addConnmarkSaveCalls != 0 {
+		t.Errorf("AddConnmarkSaveRule called %d times; want 0 when chain setup failed",
+			nfr.addConnmarkSaveCalls)
+	}
+	if nfr.addExternalCGNATCalls != 0 {
+		t.Errorf("AddExternalCGNATRules called %d times; want 0 when chain setup failed",
+			nfr.addExternalCGNATCalls)
 	}
 }

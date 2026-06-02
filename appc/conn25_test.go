@@ -8,6 +8,8 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
+	"tailscale.com/ipn/ipnext"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/appctype"
 	"tailscale.com/types/opt"
@@ -30,6 +32,8 @@ func TestPickSplitDNSPeers(t *testing.T) {
 	appTwoBytes := getBytesForAttr("app2", []string{"a.example.com"}, []string{"tag:two"})
 	appThreeBytes := getBytesForAttr("app3", []string{"woo.b.example.com", "hoo.b.example.com"}, []string{"tag:three1", "tag:three2"})
 	appFourBytes := getBytesForAttr("app4", []string{"woo.b.example.com", "c.example.com"}, []string{"tag:four1", "tag:four2"})
+	appFiveBytes := getBytesForAttr("app5", []string{"*.example.com", "example.com"}, []string{"tag:one"})
+	appSixBytes := getBytesForAttr("app6", []string{"*.Example.com", "EXAMPLE.com", "EXAMPLE.COM"}, []string{"tag:one"})
 
 	makeNodeView := func(id tailcfg.NodeID, name string, tags []string) tailcfg.NodeView {
 		return (&tailcfg.Node{
@@ -45,10 +49,12 @@ func TestPickSplitDNSPeers(t *testing.T) {
 	nvp4 := makeNodeView(4, "p4", []string{"tag:two", "tag:three2", "tag:four2"})
 
 	for _, tt := range []struct {
-		name   string
-		want   map[string][]tailcfg.NodeView
-		peers  []tailcfg.NodeView
-		config []tailcfg.RawMessage
+		name                string
+		peers               []tailcfg.NodeView
+		config              []tailcfg.RawMessage
+		isEligibleConnector bool
+		selfTags            []string
+		want                map[string][]tailcfg.NodeView
 	}{
 		{
 			name: "empty",
@@ -109,6 +115,128 @@ func TestPickSplitDNSPeers(t *testing.T) {
 				"c.example.com":     {nvp2, nvp4},
 			},
 		},
+		{
+			name: "self-connector-exclude-self-domains",
+			config: []tailcfg.RawMessage{
+				tailcfg.RawMessage(appOneBytes),
+				tailcfg.RawMessage(appTwoBytes),
+				tailcfg.RawMessage(appThreeBytes),
+				tailcfg.RawMessage(appFourBytes),
+			},
+			peers: []tailcfg.NodeView{
+				nvp1,
+				nvp2,
+				nvp3,
+				nvp4,
+			},
+			isEligibleConnector: true,
+			selfTags:            []string{"tag:three1"},
+			want: map[string][]tailcfg.NodeView{
+				// woo.b.example.com and hoo.b.example.com are covered
+				// by tag:three1, and so is this self-node.
+				// So those domains should not be routed to peers.
+				// woo.b.example.com is also covered by another tag,
+				// but still not included since this connector can route to it.
+				"example.com":   {nvp1},
+				"a.example.com": {nvp3, nvp4},
+				"c.example.com": {nvp2, nvp4},
+			},
+		},
+		{
+			name: "self-eligible-connector-no-matching-tag-include-all-domains",
+			config: []tailcfg.RawMessage{
+				tailcfg.RawMessage(appOneBytes),
+				tailcfg.RawMessage(appTwoBytes),
+				tailcfg.RawMessage(appThreeBytes),
+				tailcfg.RawMessage(appFourBytes),
+			},
+			peers: []tailcfg.NodeView{
+				nvp1,
+				nvp2,
+				nvp3,
+				nvp4,
+			},
+			isEligibleConnector: true,
+			selfTags:            []string{"tag:unrelated"},
+			want: map[string][]tailcfg.NodeView{
+				// Self has prefs set but no tags matching any app,
+				// so no domains are self-routed and all appear.
+				"example.com":       {nvp1},
+				"a.example.com":     {nvp3, nvp4},
+				"woo.b.example.com": {nvp2, nvp3, nvp4},
+				"hoo.b.example.com": {nvp3, nvp4},
+				"c.example.com":     {nvp2, nvp4},
+			},
+		},
+		{
+			name: "self-not-eligible-connector-but-tagged-include-all-domains",
+			config: []tailcfg.RawMessage{
+				tailcfg.RawMessage(appOneBytes),
+				tailcfg.RawMessage(appTwoBytes),
+				tailcfg.RawMessage(appThreeBytes),
+				tailcfg.RawMessage(appFourBytes),
+			},
+			peers: []tailcfg.NodeView{
+				nvp1,
+				nvp2,
+				nvp3,
+				nvp4,
+			},
+			selfTags: []string{"tag:three1"},
+			want: map[string][]tailcfg.NodeView{
+				// Even though this self node has a tag for an app
+				// the prefs don't advertise as connector, so
+				// should still route through other connectors.
+				"example.com":       {nvp1},
+				"a.example.com":     {nvp3, nvp4},
+				"woo.b.example.com": {nvp2, nvp3, nvp4},
+				"hoo.b.example.com": {nvp3, nvp4},
+				"c.example.com":     {nvp2, nvp4},
+			},
+		},
+		{
+			name: "wildcards-are-stripped-and-deduped",
+			config: []tailcfg.RawMessage{
+				tailcfg.RawMessage(appOneBytes),
+				tailcfg.RawMessage(appFiveBytes),
+			},
+			peers: []tailcfg.NodeView{
+				nvp1,
+			},
+			want: map[string][]tailcfg.NodeView{
+				// All the domains should be normalized to example.com
+				"example.com": {nvp1},
+			},
+		},
+		{
+			name: "domains-are-normalized-and-deduped",
+			config: []tailcfg.RawMessage{
+				tailcfg.RawMessage(appSixBytes),
+			},
+			peers: []tailcfg.NodeView{
+				nvp1,
+			},
+			want: map[string][]tailcfg.NodeView{
+				// All the domains should be normalized to example.com
+				"example.com": {nvp1},
+			},
+		},
+		{
+			name: "sub-domains-and-top-domains-do-not-collide",
+			config: []tailcfg.RawMessage{
+				tailcfg.RawMessage(appTwoBytes),
+				tailcfg.RawMessage(appFiveBytes),
+			},
+			peers: []tailcfg.NodeView{
+				nvp1,
+				nvp3,
+			},
+			want: map[string][]tailcfg.NodeView{
+				// The sub.example.com should remain distinct from example.com
+				"example.com":   {nvp1},
+				"a.example.com": {nvp3},
+			},
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			selfNode := &tailcfg.Node{}
@@ -117,6 +245,7 @@ func TestPickSplitDNSPeers(t *testing.T) {
 					tailcfg.NodeCapability(AppConnectorsExperimentalAttrName): tt.config,
 				}
 			}
+			selfNode.Tags = append(selfNode.Tags, tt.selfTags...)
 			selfView := selfNode.View()
 			peers := map[tailcfg.NodeID]tailcfg.NodeView{}
 			for _, p := range tt.peers {
@@ -124,9 +253,164 @@ func TestPickSplitDNSPeers(t *testing.T) {
 			}
 			got := PickSplitDNSPeers(func(_ tailcfg.NodeCapability) bool {
 				return true
-			}, selfView, peers)
+			}, selfView, peers, tt.isEligibleConnector)
+
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Fatalf("got %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+type testNodeBackend struct {
+	ipnext.NodeBackend
+	peers []tailcfg.NodeView
+}
+
+func (nb *testNodeBackend) AppendMatchingPeers(base []tailcfg.NodeView, pred func(tailcfg.NodeView) bool) []tailcfg.NodeView {
+	for _, p := range nb.peers {
+		if pred(p) {
+			base = append(base, p)
+		}
+	}
+	return base
+}
+
+func (nb *testNodeBackend) PeerHasPeerAPI(p tailcfg.NodeView) bool {
+	return true
+}
+
+func TestPickConnector(t *testing.T) {
+	exampleApp := appctype.Conn25Attr{
+		Name:       "example",
+		Connectors: []string{"tag:example"},
+		Domains:    []string{"example.com"},
+	}
+
+	nvWithConnectorSet := func(id tailcfg.NodeID, isConnector bool, tags ...string) tailcfg.NodeView {
+		return (&tailcfg.Node{
+			ID:       id,
+			Tags:     tags,
+			Hostinfo: (&tailcfg.Hostinfo{AppConnector: opt.NewBool(isConnector)}).View(),
+		}).View()
+	}
+
+	nv := func(id tailcfg.NodeID, tags ...string) tailcfg.NodeView {
+		return nvWithConnectorSet(id, true, tags...)
+	}
+
+	for _, tt := range []struct {
+		name       string
+		candidates []tailcfg.NodeView
+		app        appctype.Conn25Attr
+		want       []tailcfg.NodeView
+	}{
+		{
+			name:       "empty-everything",
+			candidates: []tailcfg.NodeView{},
+			app:        appctype.Conn25Attr{},
+			want:       nil,
+		},
+		{
+			name:       "empty-candidates",
+			candidates: []tailcfg.NodeView{},
+			app:        exampleApp,
+			want:       nil,
+		},
+		{
+			name:       "empty-app",
+			candidates: []tailcfg.NodeView{nv(1, "tag:example")},
+			app:        appctype.Conn25Attr{},
+			want:       nil,
+		},
+		{
+			name:       "one-matches",
+			candidates: []tailcfg.NodeView{nv(1, "tag:example")},
+			app:        exampleApp,
+			want:       []tailcfg.NodeView{nv(1, "tag:example")},
+		},
+		{
+			name: "invalid-candidate",
+			candidates: []tailcfg.NodeView{
+				{},
+				nv(1, "tag:example"),
+			},
+			app: exampleApp,
+			want: []tailcfg.NodeView{
+				nv(1, "tag:example"),
+			},
+		},
+		{
+			name: "no-host-info",
+			candidates: []tailcfg.NodeView{
+				(&tailcfg.Node{
+					ID:   1,
+					Tags: []string{"tag:example"},
+				}).View(),
+				nv(2, "tag:example"),
+			},
+			app:  exampleApp,
+			want: []tailcfg.NodeView{nv(2, "tag:example")},
+		},
+		{
+			name:       "not-a-connector",
+			candidates: []tailcfg.NodeView{nvWithConnectorSet(1, false, "tag:example.com"), nv(2, "tag:example")},
+			app:        exampleApp,
+			want:       []tailcfg.NodeView{nv(2, "tag:example")},
+		},
+		{
+			name:       "without-matches",
+			candidates: []tailcfg.NodeView{nv(1, "tag:woo"), nv(2, "tag:example")},
+			app:        exampleApp,
+			want:       []tailcfg.NodeView{nv(2, "tag:example")},
+		},
+		{
+			name:       "multi-tags",
+			candidates: []tailcfg.NodeView{nv(1, "tag:woo", "tag:hoo"), nv(2, "tag:woo", "tag:example")},
+			app:        exampleApp,
+			want:       []tailcfg.NodeView{nv(2, "tag:woo", "tag:example")},
+		},
+		{
+			name:       "multi-matches",
+			candidates: []tailcfg.NodeView{nv(1, "tag:woo", "tag:hoo"), nv(2, "tag:woo", "tag:example"), nv(3, "tag:example1", "tag:example")},
+			app: appctype.Conn25Attr{
+				Name:       "example2",
+				Connectors: []string{"tag:example1", "tag:example"},
+				Domains:    []string{"example.com"},
+			},
+			want: []tailcfg.NodeView{nv(2, "tag:woo", "tag:example"), nv(3, "tag:example1", "tag:example")},
+		},
+		{
+			name: "bit-of-everything",
+			candidates: []tailcfg.NodeView{
+				nv(3, "tag:woo", "tag:hoo"),
+				{},
+				nv(2, "tag:woo", "tag:example"),
+				nvWithConnectorSet(4, false, "tag:example"),
+				nv(1, "tag:example1", "tag:example"),
+				nv(7, "tag:example1", "tag:example"),
+				nvWithConnectorSet(5, false),
+				nv(6),
+				nvWithConnectorSet(8, false, "tag:example"),
+				nvWithConnectorSet(9, false),
+				nvWithConnectorSet(10, false),
+			},
+			app: appctype.Conn25Attr{
+				Name:       "example2",
+				Connectors: []string{"tag:example1", "tag:example", "tag:example2"},
+				Domains:    []string{"example.com"},
+			},
+			want: []tailcfg.NodeView{
+				nv(1, "tag:example1", "tag:example"),
+				nv(2, "tag:woo", "tag:example"),
+				nv(7, "tag:example1", "tag:example"),
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got := PickConnector(&testNodeBackend{peers: tt.candidates}, tt.app)
+			if diff := cmp.Diff(tt.want, got); diff != "" {
+				t.Fatalf("PickConnectors (-want, +got):\n%s", diff)
 			}
 		})
 	}

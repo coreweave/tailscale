@@ -24,12 +24,12 @@ import (
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
-	"tailscale.com/types/ptr"
 	"tailscale.com/types/views"
 	"tailscale.com/util/dnsname"
 	"tailscale.com/util/eventbus"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/slicesx"
+	"tailscale.com/util/testenv"
 	"tailscale.com/wgengine/filter"
 )
 
@@ -80,6 +80,13 @@ type nodeBackend struct {
 	eventClient    *eventbus.Client
 	derpMapViewPub *eventbus.Publisher[tailcfg.DERPMapView]
 
+	// homeDERP lives here temporarily. as long as mapSession is short lived, we
+	// don't have a location delivering netmaps to local backend that knows our
+	// homeDERP hence why it is cached here for now.
+	// TODO(cmol): move this field into a refactored mapSession that is not
+	// short lived.
+	homeDERP atomic.Int64
+
 	// TODO(nickkhyl): maybe use sync.RWMutex?
 	mu syncs.Mutex // protects the following fields
 
@@ -104,6 +111,16 @@ type nodeBackend struct {
 	// nodeByAddr maps nodes' own addresses (excluding subnet routes) to node IDs.
 	// It is mutated in place (with mu held) and must not escape the [nodeBackend].
 	nodeByAddr map[netip.Addr]tailcfg.NodeID
+
+	// nodeByKey is an index of node public key to node ID for fast lookups.
+	// It is mutated in place (with mu held) and must not escape the [nodeBackend].
+	nodeByKey map[key.NodePublic]tailcfg.NodeID
+
+	// keyWaitersForTest is the test-only registry of channels waiting for
+	// a given peer key to first appear in the netmap. See
+	// [nodeBackend.AwaitNodeKeyForTest]. It is populated lazily and remains
+	// nil in production, where no test installs a waiter.
+	keyWaitersForTest map[key.NodePublic]chan struct{}
 }
 
 func newNodeBackend(ctx context.Context, logf logger.Logf, bus *eventbus.Bus) *nodeBackend {
@@ -193,19 +210,8 @@ func (nb *nodeBackend) NodeByAddr(ip netip.Addr) (_ tailcfg.NodeID, ok bool) {
 func (nb *nodeBackend) NodeByKey(k key.NodePublic) (_ tailcfg.NodeID, ok bool) {
 	nb.mu.Lock()
 	defer nb.mu.Unlock()
-	if nb.netMap == nil {
-		return 0, false
-	}
-	if self := nb.netMap.SelfNode; self.Valid() && self.Key() == k {
-		return self.ID(), true
-	}
-	// TODO(bradfitz,nickkhyl): add nodeByKey like nodeByAddr instead of walking peers.
-	for _, n := range nb.peers {
-		if n.Key() == k {
-			return n.ID(), true
-		}
-	}
-	return 0, false
+	nid, ok := nb.nodeByKey[k]
+	return nid, ok
 }
 
 func (nb *nodeBackend) NodeByID(id tailcfg.NodeID) (_ tailcfg.NodeView, ok bool) {
@@ -414,7 +420,7 @@ func (nb *nodeBackend) netMapWithPeers() *netmap.NetworkMap {
 	if nb.netMap == nil {
 		return nil
 	}
-	nm := ptr.To(*nb.netMap) // shallow clone
+	nm := new(*nb.netMap) // shallow clone
 	nm.Peers = slicesx.MapValues(nb.peers)
 	slices.SortFunc(nm.Peers, func(a, b tailcfg.NodeView) int {
 		return cmp.Compare(a.ID(), b.ID())
@@ -427,11 +433,50 @@ func (nb *nodeBackend) SetNetMap(nm *netmap.NetworkMap) {
 	defer nb.mu.Unlock()
 	nb.netMap = nm
 	nb.updateNodeByAddrLocked()
+	nb.updateNodeByKeyLocked()
 	nb.updatePeersLocked()
+	nb.signalKeyWaitersForTestLocked()
 	if nm != nil {
 		nb.derpMapViewPub.Publish(nm.DERPMap.View())
 	} else {
 		nb.derpMapViewPub.Publish(tailcfg.DERPMapView{})
+	}
+}
+
+// AwaitNodeKeyForTest returns a channel that is closed once a peer with the
+// given node key first appears in this nodeBackend's peer index, or
+// immediately (a closed channel) if it's already present. It is intended for
+// in-process benchmarks that drive synthetic netmap deltas and need a
+// zero-overhead signal that the client has applied a delta, replacing
+// poll-based [local.Client.WhoIsNodeKey] loops in tests. It panics outside
+// of tests.
+func (nb *nodeBackend) AwaitNodeKeyForTest(k key.NodePublic) <-chan struct{} {
+	testenv.AssertInTest()
+	nb.mu.Lock()
+	defer nb.mu.Unlock()
+	if _, ok := nb.nodeByKey[k]; ok {
+		return syncs.ClosedChan()
+	}
+	if ch, ok := nb.keyWaitersForTest[k]; ok {
+		return ch
+	}
+	ch := make(chan struct{})
+	mak.Set(&nb.keyWaitersForTest, k, ch)
+	return ch
+}
+
+// signalKeyWaitersForTestLocked closes any waiter channels whose keys now
+// appear in nb.nodeByKey. It is cheap when there are no waiters, which is
+// the common case in production. It is called from [nodeBackend.SetNetMap]
+// after the per-key index has been rebuilt.
+//
+// Caller must hold nb.mu.
+func (nb *nodeBackend) signalKeyWaitersForTestLocked() {
+	for k, ch := range nb.keyWaitersForTest {
+		if _, ok := nb.nodeByKey[k]; ok {
+			close(ch)
+			delete(nb.keyWaitersForTest, k)
+		}
 	}
 }
 
@@ -467,6 +512,37 @@ func (nb *nodeBackend) updateNodeByAddrLocked() {
 	for k, v := range nb.nodeByAddr {
 		if v == 0 {
 			delete(nb.nodeByAddr, k)
+		}
+	}
+}
+
+func (nb *nodeBackend) updateNodeByKeyLocked() {
+	nm := nb.netMap
+	if nm == nil {
+		nb.nodeByKey = nil
+		return
+	}
+
+	if nb.nodeByKey == nil {
+		nb.nodeByKey = map[key.NodePublic]tailcfg.NodeID{}
+	}
+	// First pass, mark everything unwanted.
+	for k := range nb.nodeByKey {
+		nb.nodeByKey[k] = 0
+	}
+	addNode := func(n tailcfg.NodeView) {
+		nb.nodeByKey[n.Key()] = n.ID()
+	}
+	if nm.SelfNode.Valid() {
+		addNode(nm.SelfNode)
+	}
+	for _, p := range nm.Peers {
+		addNode(p)
+	}
+	// Third pass, actually delete the unwanted items.
+	for k, v := range nb.nodeByKey {
+		if v == 0 {
+			delete(nb.nodeByKey, k)
 		}
 	}
 }
@@ -840,7 +916,7 @@ func dnsConfigForNetmap(nm *netmap.NetworkMap, peers map[tailcfg.NodeID]tailcfg.
 	addSplitDNSRoutes(nm.DNS.Routes)
 
 	// Add split DNS routes for conn25
-	conn25DNSTargets := appc.PickSplitDNSPeers(nm.HasCap, nm.SelfNode, peers)
+	conn25DNSTargets := appc.PickSplitDNSPeers(nm.HasCap, nm.SelfNode, peers, prefs.AppConnector().Advertise)
 	if conn25DNSTargets != nil {
 		var m map[string][]*dnstype.Resolver
 		for domain, candidateSplitDNSPeers := range conn25DNSTargets {
