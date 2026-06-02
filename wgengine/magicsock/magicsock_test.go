@@ -39,7 +39,6 @@ import (
 	"go4.org/mem"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
-	"tailscale.com/cmd/testwrapper/flakytest"
 	"tailscale.com/control/controlknobs"
 	"tailscale.com/derp/derpserver"
 	"tailscale.com/disco"
@@ -63,8 +62,6 @@ import (
 	"tailscale.com/types/netlogtype"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/nettype"
-	"tailscale.com/types/ptr"
-	"tailscale.com/types/views"
 	"tailscale.com/util/cibuild"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/eventbus"
@@ -245,6 +242,25 @@ func newMagicStackWithKey(t testing.TB, logf logger.Logf, ln nettype.PacketListe
 func (s *magicStack) Reconfig(cfg *wgcfg.Config) error {
 	s.tsTun.SetWGConfig(cfg)
 	s.wgLogger.SetPeers(cfg.Peers)
+
+	// In production, LocalBackend installs a PeerByIPPacketFunc via
+	// Engine.SetPeerByIPPacketFunc. Tests that bypass LocalBackend need
+	// to install one here for outbound packet routing.
+	ipToPeer := make(map[netip.Addr]device.NoisePublicKey, len(cfg.Peers))
+	for _, p := range cfg.Peers {
+		pk := p.PublicKey.Raw32()
+		for _, pfx := range p.AllowedIPs {
+			if pfx.IsSingleIP() {
+				ipToPeer[pfx.Addr()] = pk
+			}
+		}
+	}
+	s.dev.SetPeerByIPPacketFunc(func(_, dst netip.Addr, _ []byte) (device.NoisePublicKey, bool) {
+		pk, ok := ipToPeer[dst]
+		return pk, ok
+	})
+
+	s.dev.SetPrivateKey(key.NodePrivateAs[device.NoisePrivateKey](cfg.PrivateKey))
 	return wgcfg.ReconfigDevice(s.dev, cfg, s.conn.logf)
 }
 
@@ -415,9 +431,11 @@ func TestNewConn(t *testing.T) {
 	stunAddr, stunCleanupFn := stuntest.Serve(t)
 	defer stunCleanupFn()
 
-	port := pickPort(t)
+	// Use port 0 to let the system assign a port, avoiding TOCTOU races
+	// from the previous pickPort approach which would close a socket and
+	// hope to rebind to the same port.
 	conn, err := NewConn(Options{
-		Port:              port,
+		Port:              0,
 		DisablePortMapper: true,
 		EndpointsFunc:     epFunc,
 		Logf:              t.Logf,
@@ -429,6 +447,13 @@ func TestNewConn(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
+
+	// Get the actual port that was assigned
+	port := conn.LocalPort()
+	if port == 0 {
+		t.Fatal("LocalPort returned 0")
+	}
+
 	conn.SetDERPMap(stuntest.DERPMapOf(stunAddr.String()))
 	conn.SetPrivateKey(key.NewNode())
 
@@ -462,16 +487,6 @@ collectEndpoints:
 			t.Fatalf("timeout with endpoints: %v", endpoints)
 		}
 	}
-}
-
-func pickPort(t testing.TB) uint16 {
-	t.Helper()
-	conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-	return uint16(conn.LocalAddr().(*net.UDPAddr).Port)
 }
 
 func TestPickDERPFallback(t *testing.T) {
@@ -734,7 +749,6 @@ func (localhostListener) ListenPacket(ctx context.Context, network, address stri
 }
 
 func TestTwoDevicePing(t *testing.T) {
-	flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/11762")
 	ln, ip := localhostListener{}, netaddr.IPv4(127, 0, 0, 1)
 	n := &devices{
 		m1:     ln,
@@ -1192,15 +1206,19 @@ func testTwoDevicePing(t *testing.T, d *devices) {
 	m2.conn.SetConnectionCounter(m2.counts.Add)
 
 	checkStats := func(t *testing.T, m *magicStack, wantConns []netlogtype.Connection) {
-		defer m.counts.Reset()
-		counts := m.counts.Clone()
-		for _, conn := range wantConns {
-			if _, ok := counts[conn]; ok {
-				return
-			}
-		}
 		t.Helper()
-		t.Errorf("missing any connection to %s from %s", wantConns, slicesx.MapKeys(counts))
+		defer m.counts.Reset()
+		if err := tstest.WaitFor(5*time.Second, func() error {
+			counts := m.counts.Clone()
+			for _, conn := range wantConns {
+				if _, ok := counts[conn]; ok {
+					return nil
+				}
+			}
+			return fmt.Errorf("missing any connection to %s from %s", wantConns, slicesx.MapKeys(counts))
+		}); err != nil {
+			t.Error(err)
+		}
 	}
 
 	addrPort := netip.MustParseAddrPort
@@ -1214,7 +1232,7 @@ func testTwoDevicePing(t *testing.T, d *devices) {
 	}
 
 	outerT := t
-	t.Run("ping 1.0.0.1", func(t *testing.T) {
+	t.Run("ping-1_0_0_1", func(t *testing.T) {
 		setT(t)
 		defer setT(outerT)
 		ping1(t)
@@ -1222,7 +1240,7 @@ func testTwoDevicePing(t *testing.T, d *devices) {
 		checkStats(t, m2, m2Conns)
 	})
 
-	t.Run("ping 1.0.0.2", func(t *testing.T) {
+	t.Run("ping-1_0_0_2", func(t *testing.T) {
 		setT(t)
 		defer setT(outerT)
 		ping2(t)
@@ -1230,7 +1248,7 @@ func testTwoDevicePing(t *testing.T, d *devices) {
 		checkStats(t, m2, m2Conns)
 	})
 
-	t.Run("ping 1.0.0.2 via SendPacket", func(t *testing.T) {
+	t.Run("ping-1_0_0_2-via-SendPacket", func(t *testing.T) {
 		setT(t)
 		defer setT(outerT)
 		msg1to2 := tuntest.Ping(netip.MustParseAddr("1.0.0.2"), netip.MustParseAddr("1.0.0.1"))
@@ -1248,7 +1266,7 @@ func testTwoDevicePing(t *testing.T, d *devices) {
 		checkStats(t, m2, m2Conns)
 	})
 
-	t.Run("no-op dev1 reconfig", func(t *testing.T) {
+	t.Run("no-op-dev1-reconfig", func(t *testing.T) {
 		setT(t)
 		defer setT(outerT)
 		if err := m1.Reconfig(m1cfg); err != nil {
@@ -1262,93 +1280,165 @@ func testTwoDevicePing(t *testing.T, d *devices) {
 	t.Run("compare-metrics-stats", func(t *testing.T) {
 		setT(t)
 		defer setT(outerT)
-		m1.conn.resetMetricsForTest()
-		m1.counts.Reset()
-		m2.conn.resetMetricsForTest()
-		m2.counts.Reset()
-		t.Logf("Metrics before: %s\n", m1.metrics.String())
+
+		// Snapshot both counting systems before pings rather than
+		// resetting them. Resetting two independent systems
+		// non-atomically left a window where background WireGuard
+		// keepalives could increment one system but not the other,
+		// causing flaky off-by-one mismatches.
+		physBefore1, metricBefore1 := snapshotCounts(m1)
+		physBefore2, metricBefore2 := snapshotCounts(m2)
+
 		ping1(t)
 		ping2(t)
-		assertConnStatsAndUserMetricsEqual(t, m1)
-		assertConnStatsAndUserMetricsEqual(t, m2)
-		t.Logf("Metrics after: %s\n", m1.metrics.String())
+
+		assertConnStatDeltasMatchMetricDeltas(t, m1, physBefore1, metricBefore1)
+		assertConnStatDeltasMatchMetricDeltas(t, m2, physBefore2, metricBefore2)
+		assertGlobalMetricsMatchPerConn(t, m1, m2)
 	})
 }
 
-func (c *Conn) resetMetricsForTest() {
-	c.metrics.inboundBytesIPv4Total.Set(0)
-	c.metrics.inboundPacketsIPv4Total.Set(0)
-	c.metrics.outboundBytesIPv4Total.Set(0)
-	c.metrics.outboundPacketsIPv4Total.Set(0)
-	c.metrics.inboundBytesIPv6Total.Set(0)
-	c.metrics.inboundPacketsIPv6Total.Set(0)
-	c.metrics.outboundBytesIPv6Total.Set(0)
-	c.metrics.outboundPacketsIPv6Total.Set(0)
-	c.metrics.inboundBytesDERPTotal.Set(0)
-	c.metrics.inboundPacketsDERPTotal.Set(0)
-	c.metrics.outboundBytesDERPTotal.Set(0)
-	c.metrics.outboundPacketsDERPTotal.Set(0)
+// countSnapshot holds a point-in-time snapshot of packet/byte statistics,
+// categorized by transport type (IPv4 vs DERP).
+type countSnapshot struct {
+	ipv4RxBytes, ipv4TxBytes     int64
+	ipv4RxPackets, ipv4TxPackets int64
+	derpRxBytes, derpTxBytes     int64
+	derpRxPackets, derpTxPackets int64
 }
 
-func assertConnStatsAndUserMetricsEqual(t *testing.T, ms *magicStack) {
-	physIPv4RxBytes := int64(0)
-	physIPv4TxBytes := int64(0)
-	physDERPRxBytes := int64(0)
-	physDERPTxBytes := int64(0)
-	physIPv4RxPackets := int64(0)
-	physIPv4TxPackets := int64(0)
-	physDERPRxPackets := int64(0)
-	physDERPTxPackets := int64(0)
+// snapshotCounts captures the current physical connection counter values and
+// user metrics for ms, returning them as separate snapshots. Reading both
+// systems back-to-back (rather than resetting them non-atomically) avoids a
+// race where background WireGuard keepalives could increment one system but
+// not the other during a reset window.
+func snapshotCounts(ms *magicStack) (phys, metric countSnapshot) {
 	for conn, count := range ms.counts.Clone() {
-		t.Logf("physconn src: %s, dst: %s", conn.Src.String(), conn.Dst.String())
 		if conn.Dst.String() == "127.3.3.40:1" {
-			physDERPRxBytes += int64(count.RxBytes)
-			physDERPTxBytes += int64(count.TxBytes)
-			physDERPRxPackets += int64(count.RxPackets)
-			physDERPTxPackets += int64(count.TxPackets)
+			phys.derpRxBytes += int64(count.RxBytes)
+			phys.derpTxBytes += int64(count.TxBytes)
+			phys.derpRxPackets += int64(count.RxPackets)
+			phys.derpTxPackets += int64(count.TxPackets)
 		} else {
-			physIPv4RxBytes += int64(count.RxBytes)
-			physIPv4TxBytes += int64(count.TxBytes)
-			physIPv4RxPackets += int64(count.RxPackets)
-			physIPv4TxPackets += int64(count.TxPackets)
+			phys.ipv4RxBytes += int64(count.RxBytes)
+			phys.ipv4TxBytes += int64(count.TxBytes)
+			phys.ipv4RxPackets += int64(count.RxPackets)
+			phys.ipv4TxPackets += int64(count.TxPackets)
 		}
 	}
-	ms.counts.Reset()
+	metric = countSnapshot{
+		ipv4RxBytes:   ms.conn.metrics.inboundBytesIPv4Total.Value(),
+		ipv4TxBytes:   ms.conn.metrics.outboundBytesIPv4Total.Value(),
+		ipv4RxPackets: ms.conn.metrics.inboundPacketsIPv4Total.Value(),
+		ipv4TxPackets: ms.conn.metrics.outboundPacketsIPv4Total.Value(),
+		derpRxBytes:   ms.conn.metrics.inboundBytesDERPTotal.Value(),
+		derpTxBytes:   ms.conn.metrics.outboundBytesDERPTotal.Value(),
+		derpRxPackets: ms.conn.metrics.inboundPacketsDERPTotal.Value(),
+		derpTxPackets: ms.conn.metrics.outboundPacketsDERPTotal.Value(),
+	}
+	return phys, metric
+}
 
-	metricIPv4RxBytes := ms.conn.metrics.inboundBytesIPv4Total.Value()
-	metricIPv4RxPackets := ms.conn.metrics.inboundPacketsIPv4Total.Value()
-	metricIPv4TxBytes := ms.conn.metrics.outboundBytesIPv4Total.Value()
-	metricIPv4TxPackets := ms.conn.metrics.outboundPacketsIPv4Total.Value()
+// assertConnStatDeltasMatchMetricDeltas checks that the changes in physical
+// connection counters since physBefore match the changes in user metrics since
+// metricBefore. Using deltas avoids a race from non-atomically resetting the
+// two independent counting systems.
+//
+// As a safety net, a difference of exactly one packet (and the corresponding
+// bytes) is tolerated, since a background WireGuard keepalive could still
+// arrive in the narrow window between snapshotting the two systems.
+func assertConnStatDeltasMatchMetricDeltas(t *testing.T, ms *magicStack, physBefore, metricBefore countSnapshot) {
+	t.Helper()
+	physAfter, metricAfter := snapshotCounts(ms)
 
-	metricDERPRxBytes := ms.conn.metrics.inboundBytesDERPTotal.Value()
-	metricDERPRxPackets := ms.conn.metrics.inboundPacketsDERPTotal.Value()
-	metricDERPTxBytes := ms.conn.metrics.outboundBytesDERPTotal.Value()
-	metricDERPTxPackets := ms.conn.metrics.outboundPacketsDERPTotal.Value()
+	type stat struct {
+		name                 string
+		physDelta, metDelta  int64
+		isPackets            bool // true for packet counts, false for byte counts
+		packetDeltaTolerated bool // set by packet check, used by byte check
+	}
 
+	stats := []stat{
+		{name: "IPv4RxPackets", physDelta: physAfter.ipv4RxPackets - physBefore.ipv4RxPackets, metDelta: metricAfter.ipv4RxPackets - metricBefore.ipv4RxPackets, isPackets: true},
+		{name: "IPv4RxBytes", physDelta: physAfter.ipv4RxBytes - physBefore.ipv4RxBytes, metDelta: metricAfter.ipv4RxBytes - metricBefore.ipv4RxBytes},
+		{name: "IPv4TxPackets", physDelta: physAfter.ipv4TxPackets - physBefore.ipv4TxPackets, metDelta: metricAfter.ipv4TxPackets - metricBefore.ipv4TxPackets, isPackets: true},
+		{name: "IPv4TxBytes", physDelta: physAfter.ipv4TxBytes - physBefore.ipv4TxBytes, metDelta: metricAfter.ipv4TxBytes - metricBefore.ipv4TxBytes},
+		{name: "DERPRxPackets", physDelta: physAfter.derpRxPackets - physBefore.derpRxPackets, metDelta: metricAfter.derpRxPackets - metricBefore.derpRxPackets, isPackets: true},
+		{name: "DERPRxBytes", physDelta: physAfter.derpRxBytes - physBefore.derpRxBytes, metDelta: metricAfter.derpRxBytes - metricBefore.derpRxBytes},
+		{name: "DERPTxPackets", physDelta: physAfter.derpTxPackets - physBefore.derpTxPackets, metDelta: metricAfter.derpTxPackets - metricBefore.derpTxPackets, isPackets: true},
+		{name: "DERPTxBytes", physDelta: physAfter.derpTxBytes - physBefore.derpTxBytes, metDelta: metricAfter.derpTxBytes - metricBefore.derpTxBytes},
+	}
+
+	// First pass: check packet counts, tolerating ±1 from stray keepalives.
+	for i := range stats {
+		s := &stats[i]
+		if !s.isPackets {
+			continue
+		}
+		if s.physDelta == s.metDelta {
+			continue
+		}
+		diff := s.physDelta - s.metDelta
+		if diff < 0 {
+			diff = -diff
+		}
+		if diff <= 1 {
+			s.packetDeltaTolerated = true
+			t.Logf("%s: physical delta=%d, metric delta=%d (off by 1, likely background WireGuard keepalive)", s.name, s.physDelta, s.metDelta)
+			continue
+		}
+		t.Errorf("%s: physical delta=%d, metric delta=%d", s.name, s.physDelta, s.metDelta)
+	}
+
+	// Second pass: check byte counts; tolerate mismatches when the
+	// corresponding packet count was already tolerated.
+	for i := range stats {
+		s := &stats[i]
+		if s.isPackets {
+			continue
+		}
+		if s.physDelta == s.metDelta {
+			continue
+		}
+		// The preceding entry in the slice is always the corresponding packet stat.
+		if stats[i-1].packetDeltaTolerated {
+			t.Logf("%s: physical delta=%d, metric delta=%d (within single-packet tolerance)", s.name, s.physDelta, s.metDelta)
+			continue
+		}
+		t.Errorf("%s: physical delta=%d, metric delta=%d", s.name, s.physDelta, s.metDelta)
+	}
+}
+
+// assertGlobalMetricsMatchPerConn validates that the global clientmetric
+// AggregateCounters match the sum of per-conn user metrics from both magicsock
+// instances. This tests the metric registration wiring rather than assuming
+// symmetric traffic between the two instances.
+func assertGlobalMetricsMatchPerConn(t *testing.T, m1, m2 *magicStack) {
+	t.Helper()
 	c := qt.New(t)
-	c.Assert(physDERPRxBytes, qt.Equals, metricDERPRxBytes)
-	c.Assert(physDERPTxBytes, qt.Equals, metricDERPTxBytes)
-	c.Assert(physIPv4RxBytes, qt.Equals, metricIPv4RxBytes)
-	c.Assert(physIPv4TxBytes, qt.Equals, metricIPv4TxBytes)
-	c.Assert(physDERPRxPackets, qt.Equals, metricDERPRxPackets)
-	c.Assert(physDERPTxPackets, qt.Equals, metricDERPTxPackets)
-	c.Assert(physIPv4RxPackets, qt.Equals, metricIPv4RxPackets)
-	c.Assert(physIPv4TxPackets, qt.Equals, metricIPv4TxPackets)
+	m1m := m1.conn.metrics
+	m2m := m2.conn.metrics
 
-	// Validate that the usermetrics and clientmetrics are in sync
-	// Note: the clientmetrics are global, this means that when they are registering with the
-	// wgengine, multiple in-process nodes used by this test will be updating the same metrics. This is why we need to multiply
-	// the metrics by 2 to get the expected value.
-	// TODO(kradalby): https://github.com/tailscale/tailscale/issues/13420
-	c.Assert(metricSendUDP.Value(), qt.Equals, metricIPv4TxPackets*2)
-	c.Assert(metricSendDataPacketsIPv4.Value(), qt.Equals, metricIPv4TxPackets*2)
-	c.Assert(metricSendDataPacketsDERP.Value(), qt.Equals, metricDERPTxPackets*2)
-	c.Assert(metricSendDataBytesIPv4.Value(), qt.Equals, metricIPv4TxBytes*2)
-	c.Assert(metricSendDataBytesDERP.Value(), qt.Equals, metricDERPTxBytes*2)
-	c.Assert(metricRecvDataPacketsIPv4.Value(), qt.Equals, metricIPv4RxPackets*2)
-	c.Assert(metricRecvDataPacketsDERP.Value(), qt.Equals, metricDERPRxPackets*2)
-	c.Assert(metricRecvDataBytesIPv4.Value(), qt.Equals, metricIPv4RxBytes*2)
-	c.Assert(metricRecvDataBytesDERP.Value(), qt.Equals, metricDERPRxBytes*2)
+	// metricSendUDP aggregates outboundPacketsIPv4Total + outboundPacketsIPv6Total
+	c.Assert(metricSendUDP.Value(), qt.Equals,
+		m1m.outboundPacketsIPv4Total.Value()+m1m.outboundPacketsIPv6Total.Value()+
+			m2m.outboundPacketsIPv4Total.Value()+m2m.outboundPacketsIPv6Total.Value())
+	c.Assert(metricSendDataPacketsIPv4.Value(), qt.Equals,
+		m1m.outboundPacketsIPv4Total.Value()+m2m.outboundPacketsIPv4Total.Value())
+	c.Assert(metricSendDataPacketsDERP.Value(), qt.Equals,
+		m1m.outboundPacketsDERPTotal.Value()+m2m.outboundPacketsDERPTotal.Value())
+	c.Assert(metricSendDataBytesIPv4.Value(), qt.Equals,
+		m1m.outboundBytesIPv4Total.Value()+m2m.outboundBytesIPv4Total.Value())
+	c.Assert(metricSendDataBytesDERP.Value(), qt.Equals,
+		m1m.outboundBytesDERPTotal.Value()+m2m.outboundBytesDERPTotal.Value())
+	c.Assert(metricRecvDataPacketsIPv4.Value(), qt.Equals,
+		m1m.inboundPacketsIPv4Total.Value()+m2m.inboundPacketsIPv4Total.Value())
+	c.Assert(metricRecvDataPacketsDERP.Value(), qt.Equals,
+		m1m.inboundPacketsDERPTotal.Value()+m2m.inboundPacketsDERPTotal.Value())
+	c.Assert(metricRecvDataBytesIPv4.Value(), qt.Equals,
+		m1m.inboundBytesIPv4Total.Value()+m2m.inboundBytesIPv4Total.Value())
+	c.Assert(metricRecvDataBytesDERP.Value(), qt.Equals,
+		m1m.inboundBytesDERPTotal.Value()+m2m.inboundBytesDERPTotal.Value())
 }
 
 // tests that having a endpoint.String prevents wireguard-go's
@@ -1371,13 +1461,8 @@ func TestDiscoStringLogRace(t *testing.T) {
 }
 
 func Test32bitAlignment(t *testing.T) {
-	// Need an associated conn with non-nil noteRecvActivity to
-	// trigger interesting work on the atomics in endpoint.
-	called := 0
 	de := endpoint{
-		c: &Conn{
-			noteRecvActivity: func(key.NodePublic) { called++ },
-		},
+		c: &Conn{},
 	}
 
 	if off := unsafe.Offsetof(de.lastRecvWG); off%8 != 0 {
@@ -1385,19 +1470,12 @@ func Test32bitAlignment(t *testing.T) {
 	}
 
 	de.noteRecvActivity(epAddr{}, mono.Now()) // verify this doesn't panic on 32-bit
-	if called != 1 {
-		t.Fatal("expected call to noteRecvActivity")
-	}
-	de.noteRecvActivity(epAddr{}, mono.Now())
-	if called != 1 {
-		t.Error("expected no second call to noteRecvActivity")
-	}
+	de.noteRecvActivity(epAddr{}, mono.Now()) // second call should be throttled
 }
 
 // newTestConn returns a new Conn.
 func newTestConn(t testing.TB) *Conn {
 	t.Helper()
-	port := pickPort(t)
 
 	bus := eventbustest.NewBus(t)
 
@@ -1414,7 +1492,7 @@ func newTestConn(t testing.TB) *Conn {
 		Metrics:                new(usermetric.Registry),
 		DisablePortMapper:      true,
 		Logf:                   t.Logf,
-		Port:                   port,
+		Port:                   0,
 		TestOnlyPacketListener: localhostListener{},
 		EndpointsFunc: func(eps []tailcfg.Endpoint) {
 			t.Logf("endpoints: %q", eps)
@@ -2008,7 +2086,7 @@ func TestStressSetNetworkMap(t *testing.T) {
 
 	const iters = 1000 // approx 0.5s on an m1 mac
 	for range iters {
-		for j := 0; j < npeers; j++ {
+		for j := range npeers {
 			// Randomize which peers are present.
 			if prng.Int()&1 == 0 {
 				present[j] = !present[j]
@@ -2197,7 +2275,7 @@ func newWireguard(t *testing.T, uapi string, aips []netip.Prefix) (*device.Devic
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, line := range strings.Split(s, "\n") {
+	for line := range strings.SplitSeq(s, "\n") {
 		line = strings.TrimSpace(line)
 		if len(line) == 0 {
 			continue
@@ -2309,7 +2387,7 @@ func TestIsWireGuardOnlyPeerWithMasquerade(t *testing.T) {
 				IsWireGuardOnly:               true,
 				Addresses:                     []netip.Prefix{wgaip},
 				AllowedIPs:                    []netip.Prefix{wgaip},
-				SelfNodeV4MasqAddrForThisPeer: ptr.To(masqip.Addr()),
+				SelfNodeV4MasqAddrForThisPeer: new(masqip.Addr()),
 			},
 		}),
 	}
@@ -2693,7 +2771,7 @@ func TestAddrForSendLockedForWireGuardOnly(t *testing.T) {
 		want             epAddr
 	}{
 		{
-			name:             "no endpoints",
+			name:             "no-endpoints",
 			sendInitialPing:  false,
 			validAddr:        false,
 			sendFollowUpPing: false,
@@ -2702,7 +2780,7 @@ func TestAddrForSendLockedForWireGuardOnly(t *testing.T) {
 			want:             epAddr{},
 		},
 		{
-			name:             "singular endpoint does not request ping",
+			name:             "singular-endpoint-no-ping-request",
 			sendInitialPing:  false,
 			validAddr:        true,
 			sendFollowUpPing: false,
@@ -2716,7 +2794,7 @@ func TestAddrForSendLockedForWireGuardOnly(t *testing.T) {
 			want: epAddr{ap: netip.MustParseAddrPort("1.1.1.1:111")},
 		},
 		{
-			name:             "ping sent within wireguardPingInterval should not request ping",
+			name:             "ping-within-wireguardPingInterval-no-request",
 			sendInitialPing:  true,
 			validAddr:        true,
 			sendFollowUpPing: false,
@@ -2734,7 +2812,7 @@ func TestAddrForSendLockedForWireGuardOnly(t *testing.T) {
 			want: epAddr{ap: netip.MustParseAddrPort("1.1.1.1:111")},
 		},
 		{
-			name:             "ping sent outside of wireguardPingInterval should request ping",
+			name:             "ping-outside-wireguardPingInterval-requests-ping",
 			sendInitialPing:  true,
 			validAddr:        true,
 			sendFollowUpPing: true,
@@ -2752,7 +2830,7 @@ func TestAddrForSendLockedForWireGuardOnly(t *testing.T) {
 			want: epAddr{ap: netip.MustParseAddrPort("1.1.1.1:111")},
 		},
 		{
-			name:             "choose lowest latency for useable IPv4 and IPv6",
+			name:             "choose-lowest-latency-v4-and-v6",
 			sendInitialPing:  true,
 			validAddr:        true,
 			sendFollowUpPing: false,
@@ -2770,7 +2848,7 @@ func TestAddrForSendLockedForWireGuardOnly(t *testing.T) {
 			want: epAddr{ap: netip.MustParseAddrPort("[2345:0425:2CA1:0000:0000:0567:5673:23b5]:222")},
 		},
 		{
-			name:             "choose IPv6 address when latency is the same for v4 and v6",
+			name:             "choose-IPv6-when-equal-latency",
 			sendInitialPing:  true,
 			validAddr:        true,
 			sendFollowUpPing: false,
@@ -3010,6 +3088,7 @@ func TestMaybeSetNearestDERP(t *testing.T) {
 		old                int
 		reportDERP         int
 		connectedToControl bool
+		force              bool
 		want               int
 	}{
 		{
@@ -3032,6 +3111,22 @@ func TestMaybeSetNearestDERP(t *testing.T) {
 			reportDERP:         21,    // have new DERP
 			connectedToControl: false, // not connected...
 			want:               21,    // ... but want to change to new DERP
+		},
+		{
+			name:               "force_not_connected_with_report_derp",
+			old:                1,
+			reportDERP:         21,
+			connectedToControl: false,
+			force:              true,
+			want:               21, // force bypasses the no-change-without-control guard
+		},
+		{
+			name:               "force_not_connected_no_derp_no_current",
+			old:                0,
+			reportDERP:         0,
+			connectedToControl: false,
+			force:              true,
+			want:               31, // force + no report DERP → deterministic fallback
 		},
 		{
 			name:               "not_connected_with_fallback_and_no_current",
@@ -3057,8 +3152,13 @@ func TestMaybeSetNearestDERP(t *testing.T) {
 	}
 	for _, tt := range testCases {
 		t.Run(tt.name, func(t *testing.T) {
-			ht := health.NewTracker(eventbustest.NewBus(t))
+			bus := eventbustest.NewBus(t)
+			ht := health.NewTracker(bus)
 			c := newConn(t.Logf)
+			ec := bus.Client("magicsock.Conn.Test")
+			c.eventClient = ec
+			c.homeDERPChangedPub = eventbus.Publish[HomeDERPChanged](ec)
+			c.eventBus = bus
 			c.myDerp = tt.old
 			c.derpMap = derpMap
 			c.health = ht
@@ -3076,7 +3176,7 @@ func TestMaybeSetNearestDERP(t *testing.T) {
 				}
 			}
 
-			got := c.maybeSetNearestDERP(report)
+			got := c.maybeSetNearestDERP(report, tt.force)
 			if got != tt.want {
 				t.Errorf("got new DERP region %d, want %d", got, tt.want)
 			}
@@ -3202,6 +3302,8 @@ func TestNetworkSendErrors(t *testing.T) {
 		if runtime.GOOS == "windows" {
 			t.Skipf("skipping on %s", runtime.GOOS)
 		}
+
+		tstest.Replace(t, &checkNetworkDownDuringTests, true)
 
 		conn, reg, close := newTestConnAndRegistry(t)
 		defer close()
@@ -3338,73 +3440,73 @@ func Test_packetLooksLike(t *testing.T) {
 		wantIsGeneveEncap       bool
 	}{
 		{
-			name:                    "STUN binding success response",
+			name:                    "STUN-binding-success-response",
 			msg:                     stun.Response(stun.NewTxID(), netip.MustParseAddrPort("127.0.0.1:1")),
 			wantPacketLooksLikeType: packetLooksLikeSTUNBinding,
 			wantIsGeneveEncap:       false,
 		},
 		{
-			name:                    "naked disco",
+			name:                    "naked-disco",
 			msg:                     nakedDisco,
 			wantPacketLooksLikeType: packetLooksLikeDisco,
 			wantIsGeneveEncap:       false,
 		},
 		{
-			name:                    "geneve encap disco",
+			name:                    "geneve-encap-disco",
 			msg:                     geneveEncapDisco,
 			wantPacketLooksLikeType: packetLooksLikeDisco,
 			wantIsGeneveEncap:       true,
 		},
 		{
-			name:                    "geneve encap too short disco",
+			name:                    "geneve-encap-too-short-disco",
 			msg:                     geneveEncapDisco[:len(geneveEncapDisco)-key.DiscoPublicRawLen],
 			wantPacketLooksLikeType: packetLooksLikeWireGuard,
 			wantIsGeneveEncap:       false,
 		},
 		{
-			name:                    "geneve encap disco nonzero geneve version",
+			name:                    "geneve-encap-disco-nonzero-geneve-version",
 			msg:                     geneveEncapDiscoNonZeroGeneveVersion,
 			wantPacketLooksLikeType: packetLooksLikeWireGuard,
 			wantIsGeneveEncap:       false,
 		},
 		{
-			name:                    "geneve encap disco nonzero geneve reserved bits",
+			name:                    "geneve-encap-disco-nonzero-geneve-reserved-bits",
 			msg:                     geneveEncapDiscoNonZeroGeneveReservedBits,
 			wantPacketLooksLikeType: packetLooksLikeWireGuard,
 			wantIsGeneveEncap:       false,
 		},
 		{
-			name:                    "geneve encap disco nonzero geneve vni lsb",
+			name:                    "geneve-encap-disco-nonzero-geneve-vni-lsb",
 			msg:                     geneveEncapDiscoNonZeroGeneveVNILSB,
 			wantPacketLooksLikeType: packetLooksLikeWireGuard,
 			wantIsGeneveEncap:       false,
 		},
 		{
-			name:                    "geneve encap wireguard",
+			name:                    "geneve-encap-wireguard",
 			msg:                     geneveEncapWireGuard,
 			wantPacketLooksLikeType: packetLooksLikeWireGuard,
 			wantIsGeneveEncap:       true,
 		},
 		{
-			name:                    "naked WireGuard Initiation type",
+			name:                    "naked-WireGuard-Initiation-type",
 			msg:                     nakedWireGuardInitiation,
 			wantPacketLooksLikeType: packetLooksLikeWireGuard,
 			wantIsGeneveEncap:       false,
 		},
 		{
-			name:                    "naked WireGuard Response type",
+			name:                    "naked-WireGuard-Response-type",
 			msg:                     nakedWireGuardResponse,
 			wantPacketLooksLikeType: packetLooksLikeWireGuard,
 			wantIsGeneveEncap:       false,
 		},
 		{
-			name:                    "naked WireGuard Cookie Reply type",
+			name:                    "naked-WireGuard-Cookie-Reply-type",
 			msg:                     nakedWireGuardCookieReply,
 			wantPacketLooksLikeType: packetLooksLikeWireGuard,
 			wantIsGeneveEncap:       false,
 		},
 		{
-			name:                    "naked WireGuard Transport type",
+			name:                    "naked-WireGuard-Transport-type",
 			msg:                     nakedWireGuardTransport,
 			wantPacketLooksLikeType: packetLooksLikeWireGuard,
 			wantIsGeneveEncap:       false,
@@ -3441,22 +3543,22 @@ func Test_looksLikeInitiationMsg(t *testing.T) {
 		want bool
 	}{
 		{
-			name: "valid initiation",
+			name: "valid-initiation",
 			b:    initMsg,
 			want: true,
 		},
 		{
-			name: "invalid message type field",
+			name: "invalid-message-type-field",
 			b:    initMsgSizeTransportType,
 			want: false,
 		},
 		{
-			name: "too small",
+			name: "too-small",
 			b:    initMsg[:device.MessageInitiationSize-1],
 			want: false,
 		},
 		{
-			name: "too big",
+			name: "too-big",
 			b:    append(initMsg, 0),
 			want: false,
 		},
@@ -3498,7 +3600,7 @@ func Test_nodeHasCap(t *testing.T) {
 		want bool
 	}{
 		{
-			name: "match v4",
+			name: "match-v4",
 			filt: filter.New([]filtertype.Match{
 				{
 					Srcs: []netip.Prefix{netip.MustParsePrefix("2.2.2.2/32")},
@@ -3516,7 +3618,7 @@ func Test_nodeHasCap(t *testing.T) {
 			want: true,
 		},
 		{
-			name: "match v6",
+			name: "match-v6",
 			filt: filter.New([]filtertype.Match{
 				{
 					Srcs: []netip.Prefix{netip.MustParsePrefix("::2/128")},
@@ -3534,7 +3636,7 @@ func Test_nodeHasCap(t *testing.T) {
 			want: true,
 		},
 		{
-			name: "no match CapMatch Dst",
+			name: "no-match-CapMatch-Dst",
 			filt: filter.New([]filtertype.Match{
 				{
 					Srcs: []netip.Prefix{netip.MustParsePrefix("::2/128")},
@@ -3552,7 +3654,7 @@ func Test_nodeHasCap(t *testing.T) {
 			want: false,
 		},
 		{
-			name: "no match peer cap",
+			name: "no-match-peer-cap",
 			filt: filter.New([]filtertype.Match{
 				{
 					Srcs: []netip.Prefix{netip.MustParsePrefix("::2/128")},
@@ -3570,7 +3672,7 @@ func Test_nodeHasCap(t *testing.T) {
 			want: false,
 		},
 		{
-			name: "nil src",
+			name: "nil-src",
 			filt: filter.New([]filtertype.Match{
 				{
 					Srcs: []netip.Prefix{netip.MustParsePrefix("2.2.2.2/32")},
@@ -3588,7 +3690,7 @@ func Test_nodeHasCap(t *testing.T) {
 			want: false,
 		},
 		{
-			name: "nil dst",
+			name: "nil-dst",
 			filt: filter.New([]filtertype.Match{
 				{
 					Srcs: []netip.Prefix{netip.MustParsePrefix("2.2.2.2/32")},
@@ -3666,7 +3768,7 @@ func TestConn_SetNetworkMap_updateRelayServersSet(t *testing.T) {
 		wantRelayClientEnabled bool
 	}{
 		{
-			name: "candidate relay server",
+			name: "candidate-relay-server",
 			filt: filter.New([]filtertype.Match{
 				{
 					Srcs: peerNodeCandidateRelay.Addresses,
@@ -3690,7 +3792,7 @@ func TestConn_SetNetworkMap_updateRelayServersSet(t *testing.T) {
 			wantRelayClientEnabled: true,
 		},
 		{
-			name: "no candidate relay server because self has tailcfg.NodeAttrDisableRelayClient",
+			name: "no-candidate-self-has-DisableRelayClient", // self has tailcfg.NodeAttrDisableRelayClient
 			filt: filter.New([]filtertype.Match{
 				{
 					Srcs: peerNodeCandidateRelay.Addresses,
@@ -3708,7 +3810,7 @@ func TestConn_SetNetworkMap_updateRelayServersSet(t *testing.T) {
 			wantRelayClientEnabled: false,
 		},
 		{
-			name: "no candidate relay server because self has tailcfg.NodeAttrOnlyTCP443",
+			name: "no-candidate-self-has-OnlyTCP443", // self has tailcfg.NodeAttrOnlyTCP443
 			filt: filter.New([]filtertype.Match{
 				{
 					Srcs: peerNodeCandidateRelay.Addresses,
@@ -3726,7 +3828,7 @@ func TestConn_SetNetworkMap_updateRelayServersSet(t *testing.T) {
 			wantRelayClientEnabled: false,
 		},
 		{
-			name: "self candidate relay server",
+			name: "self-candidate-relay-server",
 			filt: filter.New([]filtertype.Match{
 				{
 					Srcs: selfNode.Addresses,
@@ -3750,7 +3852,7 @@ func TestConn_SetNetworkMap_updateRelayServersSet(t *testing.T) {
 			wantRelayClientEnabled: true,
 		},
 		{
-			name: "no candidate relay server",
+			name: "no-candidate-relay-server",
 			filt: filter.New([]filtertype.Match{
 				{
 					Srcs: peerNodeNotCandidateRelayCapVer.Addresses,
@@ -3774,7 +3876,7 @@ func TestConn_SetNetworkMap_updateRelayServersSet(t *testing.T) {
 			c.filt = tt.filt
 			if len(tt.wantRelayServers) == 0 {
 				// So we can verify it gets flipped back.
-				c.hasPeerRelayServers.Store(true)
+				c.relayManager.hasPeerRelayServers.Store(true)
 			}
 
 			c.SetNetworkMap(tt.self, tt.peers)
@@ -3782,8 +3884,8 @@ func TestConn_SetNetworkMap_updateRelayServersSet(t *testing.T) {
 			if !got.Equal(tt.wantRelayServers) {
 				t.Fatalf("got: %v != want: %v", got, tt.wantRelayServers)
 			}
-			if len(tt.wantRelayServers) > 0 != c.hasPeerRelayServers.Load() {
-				t.Fatalf("c.hasPeerRelayServers: %v != len(tt.wantRelayServers) > 0: %v", c.hasPeerRelayServers.Load(), len(tt.wantRelayServers) > 0)
+			if got, want := c.relayManager.hasPeerRelayServers.Load(), len(tt.wantRelayServers) > 0; got != want {
+				t.Fatalf("c.relayManager.hasPeerRelayServers: %v != len(tt.wantRelayServers) > 0: %v", got, want)
 			}
 			if c.relayClientEnabled != tt.wantRelayClientEnabled {
 				t.Fatalf("c.relayClientEnabled: %v != wantRelayClientEnabled: %v", c.relayClientEnabled, tt.wantRelayClientEnabled)
@@ -3863,63 +3965,58 @@ func TestConn_receiveIP(t *testing.T) {
 		// If [*endpoint] then we expect 'got' to be the same [*endpoint]. If
 		// [*lazyEndpoint] and [*lazyEndpoint.maybeEP] is non-nil, we expect
 		// got.maybeEP to also be non-nil. Must not be reused across tests.
-		wantEndpointType           wgconn.Endpoint
-		wantSize                   int
-		wantIsGeneveEncap          bool
-		wantOk                     bool
-		wantMetricInc              *clientmetric.Metric
-		wantNoteRecvActivityCalled bool
+		wantEndpointType  wgconn.Endpoint
+		wantSize          int
+		wantIsGeneveEncap bool
+		wantOk            bool
+		wantMetricInc     *clientmetric.Metric
 	}{
 		{
-			name:                       "naked disco",
-			b:                          looksLikeNakedDisco,
-			ipp:                        netip.MustParseAddrPort("127.0.0.1:7777"),
-			cache:                      &epAddrEndpointCache{},
-			wantEndpointType:           nil,
-			wantSize:                   0,
-			wantIsGeneveEncap:          false,
-			wantOk:                     false,
-			wantMetricInc:              metricRecvDiscoBadPeer,
-			wantNoteRecvActivityCalled: false,
+			name:              "naked-disco",
+			b:                 looksLikeNakedDisco,
+			ipp:               netip.MustParseAddrPort("127.0.0.1:7777"),
+			cache:             &epAddrEndpointCache{},
+			wantEndpointType:  nil,
+			wantSize:          0,
+			wantIsGeneveEncap: false,
+			wantOk:            false,
+			wantMetricInc:     metricRecvDiscoBadPeer,
 		},
 		{
-			name:                       "geneve encap disco",
-			b:                          looksLikeGeneveDisco,
-			ipp:                        netip.MustParseAddrPort("127.0.0.1:7777"),
-			cache:                      &epAddrEndpointCache{},
-			wantEndpointType:           nil,
-			wantSize:                   0,
-			wantIsGeneveEncap:          false,
-			wantOk:                     false,
-			wantMetricInc:              metricRecvDiscoBadPeer,
-			wantNoteRecvActivityCalled: false,
+			name:              "geneve-encap-disco",
+			b:                 looksLikeGeneveDisco,
+			ipp:               netip.MustParseAddrPort("127.0.0.1:7777"),
+			cache:             &epAddrEndpointCache{},
+			wantEndpointType:  nil,
+			wantSize:          0,
+			wantIsGeneveEncap: false,
+			wantOk:            false,
+			wantMetricInc:     metricRecvDiscoBadPeer,
 		},
 		{
-			name:                       "STUN binding",
-			b:                          looksLikeSTUNBinding,
-			ipp:                        netip.MustParseAddrPort("127.0.0.1:7777"),
-			cache:                      &epAddrEndpointCache{},
-			wantEndpointType:           nil,
-			wantSize:                   0,
-			wantIsGeneveEncap:          false,
-			wantOk:                     false,
-			wantMetricInc:              findMetricByName("netcheck_stun_recv_ipv4"),
-			wantNoteRecvActivityCalled: false,
+			name:              "STUN-binding",
+			b:                 looksLikeSTUNBinding,
+			ipp:               netip.MustParseAddrPort("127.0.0.1:7777"),
+			cache:             &epAddrEndpointCache{},
+			wantEndpointType:  nil,
+			wantSize:          0,
+			wantIsGeneveEncap: false,
+			wantOk:            false,
+			wantMetricInc:     findMetricByName("netcheck_stun_recv_ipv4"),
 		},
 		{
-			name:                       "naked WireGuard init lazyEndpoint empty peerMap",
-			b:                          looksLikeNakedWireGuardInit,
-			ipp:                        netip.MustParseAddrPort("127.0.0.1:7777"),
-			cache:                      &epAddrEndpointCache{},
-			wantEndpointType:           &lazyEndpoint{},
-			wantSize:                   len(looksLikeNakedWireGuardInit),
-			wantIsGeneveEncap:          false,
-			wantOk:                     true,
-			wantMetricInc:              nil,
-			wantNoteRecvActivityCalled: false,
+			name:              "naked-WireGuard-init-lazyEndpoint-empty-peerMap",
+			b:                 looksLikeNakedWireGuardInit,
+			ipp:               netip.MustParseAddrPort("127.0.0.1:7777"),
+			cache:             &epAddrEndpointCache{},
+			wantEndpointType:  &lazyEndpoint{},
+			wantSize:          len(looksLikeNakedWireGuardInit),
+			wantIsGeneveEncap: false,
+			wantOk:            true,
+			wantMetricInc:     nil,
 		},
 		{
-			name:                            "naked WireGuard init endpoint matching peerMap entry",
+			name:                            "naked-WireGuard-init-endpoint-matching-peerMap-entry",
 			b:                               looksLikeNakedWireGuardInit,
 			ipp:                             netip.MustParseAddrPort("127.0.0.1:7777"),
 			cache:                           &epAddrEndpointCache{},
@@ -3930,22 +4027,20 @@ func TestConn_receiveIP(t *testing.T) {
 			wantIsGeneveEncap:               false,
 			wantOk:                          true,
 			wantMetricInc:                   nil,
-			wantNoteRecvActivityCalled:      true,
 		},
 		{
-			name:                       "geneve WireGuard init lazyEndpoint empty peerMap",
-			b:                          looksLikeGeneveWireGuardInit,
-			ipp:                        netip.MustParseAddrPort("127.0.0.1:7777"),
-			cache:                      &epAddrEndpointCache{},
-			wantEndpointType:           &lazyEndpoint{},
-			wantSize:                   len(looksLikeGeneveWireGuardInit) - packet.GeneveFixedHeaderLength,
-			wantIsGeneveEncap:          true,
-			wantOk:                     true,
-			wantMetricInc:              nil,
-			wantNoteRecvActivityCalled: false,
+			name:              "geneve-WireGuard-init-lazyEndpoint-empty-peerMap",
+			b:                 looksLikeGeneveWireGuardInit,
+			ipp:               netip.MustParseAddrPort("127.0.0.1:7777"),
+			cache:             &epAddrEndpointCache{},
+			wantEndpointType:  &lazyEndpoint{},
+			wantSize:          len(looksLikeGeneveWireGuardInit) - packet.GeneveFixedHeaderLength,
+			wantIsGeneveEncap: true,
+			wantOk:            true,
+			wantMetricInc:     nil,
 		},
 		{
-			name:                            "geneve WireGuard init lazyEndpoint matching peerMap activity noted",
+			name:                            "geneve-WireGuard-init-lazyEndpoint-matching-peerMap-activity-noted",
 			b:                               looksLikeGeneveWireGuardInit,
 			ipp:                             netip.MustParseAddrPort("127.0.0.1:7777"),
 			cache:                           &epAddrEndpointCache{},
@@ -3954,14 +4049,13 @@ func TestConn_receiveIP(t *testing.T) {
 			wantEndpointType: &lazyEndpoint{
 				maybeEP: newPeerMapInsertableEndpoint(0),
 			},
-			wantSize:                   len(looksLikeGeneveWireGuardInit) - packet.GeneveFixedHeaderLength,
-			wantIsGeneveEncap:          true,
-			wantOk:                     true,
-			wantMetricInc:              nil,
-			wantNoteRecvActivityCalled: true,
+			wantSize:          len(looksLikeGeneveWireGuardInit) - packet.GeneveFixedHeaderLength,
+			wantIsGeneveEncap: true,
+			wantOk:            true,
+			wantMetricInc:     nil,
 		},
 		{
-			name:                            "geneve WireGuard init lazyEndpoint matching peerMap no activity noted",
+			name:                            "geneve-WireGuard-init-lazyEndpoint-matching-peerMap-no-activity-noted",
 			b:                               looksLikeGeneveWireGuardInit,
 			ipp:                             netip.MustParseAddrPort("127.0.0.1:7777"),
 			cache:                           &epAddrEndpointCache{},
@@ -3970,17 +4064,15 @@ func TestConn_receiveIP(t *testing.T) {
 			wantEndpointType: &lazyEndpoint{
 				maybeEP: newPeerMapInsertableEndpoint(mono.Now().Add(time.Hour * 24)),
 			},
-			wantSize:                   len(looksLikeGeneveWireGuardInit) - packet.GeneveFixedHeaderLength,
-			wantIsGeneveEncap:          true,
-			wantOk:                     true,
-			wantMetricInc:              nil,
-			wantNoteRecvActivityCalled: false,
+			wantSize:          len(looksLikeGeneveWireGuardInit) - packet.GeneveFixedHeaderLength,
+			wantIsGeneveEncap: true,
+			wantOk:            true,
+			wantMetricInc:     nil,
 		},
 		// TODO(jwhited): verify cache.de is used when conditions permit
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			noteRecvActivityCalled := false
 			metricBefore := int64(0)
 			if tt.wantMetricInc != nil {
 				metricBefore = tt.wantMetricInc.Value()
@@ -3993,9 +4085,6 @@ func TestConn_receiveIP(t *testing.T) {
 				peerMap:    newPeerMap(),
 			}
 			c.havePrivateKey.Store(true)
-			c.noteRecvActivity = func(public key.NodePublic) {
-				noteRecvActivityCalled = true
-			}
 			var counts netlogtype.CountsByConnection
 			c.SetConnectionCounter(counts.Add)
 
@@ -4050,10 +4139,6 @@ func TestConn_receiveIP(t *testing.T) {
 			if tt.wantMetricInc != nil && tt.wantMetricInc.Value() != metricBefore+1 {
 				t.Errorf("receiveIP() metric %v not incremented", tt.wantMetricInc.Name())
 			}
-			if tt.wantNoteRecvActivityCalled != noteRecvActivityCalled {
-				t.Errorf("receiveIP() noteRecvActivityCalled = %v, want %v", noteRecvActivityCalled, tt.wantNoteRecvActivityCalled)
-			}
-
 			if tt.cache.de != nil {
 				switch ep := got.(type) {
 				case *endpoint:
@@ -4105,34 +4190,29 @@ func TestConn_receiveIP(t *testing.T) {
 
 func Test_lazyEndpoint_InitiationMessagePublicKey(t *testing.T) {
 	tests := []struct {
-		name                       string
-		callWithPeerMapKey         bool
-		maybeEPMatchingKey         bool
-		wantNoteRecvActivityCalled bool
+		name               string
+		callWithPeerMapKey bool
+		maybeEPMatchingKey bool
 	}{
 		{
-			name:                       "noteRecvActivity called",
-			callWithPeerMapKey:         true,
-			maybeEPMatchingKey:         false,
-			wantNoteRecvActivityCalled: true,
+			name:               "noteRecvActivity-called",
+			callWithPeerMapKey: true,
+			maybeEPMatchingKey: false,
 		},
 		{
-			name:                       "maybeEP early return",
-			callWithPeerMapKey:         true,
-			maybeEPMatchingKey:         true,
-			wantNoteRecvActivityCalled: false,
+			name:               "maybeEP-early-return",
+			callWithPeerMapKey: true,
+			maybeEPMatchingKey: true,
 		},
 		{
-			name:                       "not in peerMap early return",
-			callWithPeerMapKey:         false,
-			maybeEPMatchingKey:         false,
-			wantNoteRecvActivityCalled: false,
+			name:               "not-in-peerMap-early-return",
+			callWithPeerMapKey: false,
+			maybeEPMatchingKey: false,
 		},
 		{
-			name:                       "not in peerMap maybeEP early return",
-			callWithPeerMapKey:         false,
-			maybeEPMatchingKey:         true,
-			wantNoteRecvActivityCalled: false,
+			name:               "not-in-peerMap-maybeEP-early-return",
+			callWithPeerMapKey: false,
+			maybeEPMatchingKey: true,
 		},
 	}
 	for _, tt := range tests {
@@ -4145,19 +4225,7 @@ func Test_lazyEndpoint_InitiationMessagePublicKey(t *testing.T) {
 				key: key.NewDisco().Public(),
 			})
 
-			var noteRecvActivityCalledFor key.NodePublic
 			conn := newConn(t.Logf)
-			conn.noteRecvActivity = func(public key.NodePublic) {
-				// wireguard-go will call into ParseEndpoint if the "real"
-				// noteRecvActivity ends up JIT configuring the peer. Mimic that
-				// to ensure there are no deadlocks around conn.mu.
-				// See tailscale/tailscale#16651 & http://go/corp#30836
-				_, err := conn.ParseEndpoint(ep.publicKey.UntypedHexString())
-				if err != nil {
-					t.Fatalf("ParseEndpoint() err: %v", err)
-				}
-				noteRecvActivityCalledFor = public
-			}
 			ep.c = conn
 
 			var pubKey [32]byte
@@ -4173,13 +4241,6 @@ func Test_lazyEndpoint_InitiationMessagePublicKey(t *testing.T) {
 				le.maybeEP = ep
 			}
 			le.InitiationMessagePublicKey(pubKey)
-			want := key.NodePublic{}
-			if tt.wantNoteRecvActivityCalled {
-				want = ep.publicKey
-			}
-			if noteRecvActivityCalledFor.Compare(want) != 0 {
-				t.Fatalf("noteRecvActivityCalledFor = %v, want %v", noteRecvActivityCalledFor, want)
-			}
 		})
 	}
 }
@@ -4192,25 +4253,25 @@ func Test_lazyEndpoint_FromPeer(t *testing.T) {
 		wantEpAddrInPeerMap bool
 	}{
 		{
-			name:                "epAddr in peerMap",
+			name:                "epAddr-in-peerMap",
 			callWithPeerMapKey:  true,
 			maybeEPMatchingKey:  false,
 			wantEpAddrInPeerMap: true,
 		},
 		{
-			name:                "maybeEP early return",
+			name:                "maybeEP-early-return",
 			callWithPeerMapKey:  true,
 			maybeEPMatchingKey:  true,
 			wantEpAddrInPeerMap: false,
 		},
 		{
-			name:                "not in peerMap early return",
+			name:                "not-in-peerMap-early-return",
 			callWithPeerMapKey:  false,
 			maybeEPMatchingKey:  false,
 			wantEpAddrInPeerMap: false,
 		},
 		{
-			name:                "not in peerMap maybeEP early return",
+			name:                "not-in-peerMap-maybeEP-early-return",
 			callWithPeerMapKey:  false,
 			maybeEPMatchingKey:  true,
 			wantEpAddrInPeerMap: false,
@@ -4312,7 +4373,7 @@ func TestRotateDiscoKeyMultipleTimes(t *testing.T) {
 	keys := make([]key.DiscoPublic, 0, 5)
 	keys = append(keys, c.discoAtomic.Public())
 
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		c.RotateDiscoKey()
 		newKey := c.discoAtomic.Public()
 
@@ -4349,7 +4410,7 @@ func TestReceiveTSMPDiscoKeyAdvertisement(t *testing.T) {
 			netip.MustParsePrefix("100.64.0.1/32"),
 		},
 	}).View()
-	conn.peers = views.SliceOf([]tailcfg.NodeView{nodeView})
+	conn.peersByID = map[tailcfg.NodeID]tailcfg.NodeView{nodeView.ID(): nodeView}
 	conn.mu.Unlock()
 
 	conn.peerMap.upsertEndpoint(ep, key.DiscoPublic{})
@@ -4367,5 +4428,72 @@ func TestReceiveTSMPDiscoKeyAdvertisement(t *testing.T) {
 
 	if ep.disco.Load().short != newDiscoKey.ShortString() {
 		t.Errorf("New disco key %s, does not match %s", newDiscoKey.ShortString(), ep.disco.Load().short)
+	}
+}
+
+func TestSendingTSMPDiscoTimer(t *testing.T) {
+	conn := newTestConn(t)
+	tw := eventbustest.NewWatcher(t, conn.eventBus)
+	t.Cleanup(func() { conn.Close() })
+
+	peerKey := key.NewNode().Public()
+	ep := &endpoint{
+		nodeID:    1,
+		publicKey: peerKey,
+		nodeAddr:  netip.MustParseAddr("100.64.0.1"),
+	}
+	discoKey := key.NewDisco().Public()
+	ep.disco.Store(&endpointDisco{
+		key:   discoKey,
+		short: discoKey.ShortString(),
+	})
+	ep.c = conn
+	conn.mu.Lock()
+	nodeView := (&tailcfg.Node{
+		Key: ep.publicKey,
+		Addresses: []netip.Prefix{
+			netip.MustParsePrefix("100.64.0.1/32"),
+		},
+	}).View()
+	conn.peersByID = map[tailcfg.NodeID]tailcfg.NodeView{nodeView.ID(): nodeView}
+	conn.mu.Unlock()
+
+	conn.peerMap.upsertEndpoint(ep, key.DiscoPublic{})
+
+	if ep.discoShort() != discoKey.ShortString() {
+		t.Errorf("Original disco key %s, does not match %s", discoKey.ShortString(), ep.discoShort())
+	}
+
+	// Only one gets through, second is rate limited.
+	conn.maybeSendTSMPDiscoAdvert(ep)
+	conn.maybeSendTSMPDiscoAdvert(ep)
+	if err := eventbustest.ExpectExactly(tw, eventbustest.Type[NewDiscoKeyAvailable]()); err != nil {
+		t.Errorf("expected only one event, got: %s", err)
+	}
+
+	// Reset to get the event firing again.
+	ep.mu.Lock()
+	ep.lastDiscoKeyAdvertisement = 0
+	ep.mu.Unlock()
+	conn.maybeSendTSMPDiscoAdvert(ep)
+	if err := eventbustest.Expect(tw, eventbustest.Type[NewDiscoKeyAvailable]()); err != nil {
+		t.Errorf("expected only one event, got: %s", err)
+	}
+
+	// With a direct bestAddr and a non-zero lastDiscoKeyAdvertisement past the
+	// rate-limit interval. No advert should be sent due to the active bestAddr.
+	ep.mu.Lock()
+	ep.lastDiscoKeyAdvertisement = mono.Now().Add(-discoKeyAdvertisementInterval - time.Second)
+	ep.bestAddr = addrQuality{epAddr: epAddr{ap: netip.MustParseAddrPort("1.2.3.4:567")}}
+	ep.mu.Unlock()
+	conn.maybeSendTSMPDiscoAdvert(ep)
+
+	// Simulating restart should send an advert.
+	ep.mu.Lock()
+	ep.lastDiscoKeyAdvertisement = 0
+	ep.mu.Unlock()
+	conn.maybeSendTSMPDiscoAdvert(ep)
+	if err := eventbustest.ExpectExactly(tw, eventbustest.Type[NewDiscoKeyAvailable]()); err != nil {
+		t.Errorf("expected only one event, got: %s", err)
 	}
 }

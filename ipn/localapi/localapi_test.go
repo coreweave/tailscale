@@ -202,6 +202,72 @@ func TestWhoIsArgTypes(t *testing.T) {
 	}
 }
 
+type fakePeerByIDBackend map[tailcfg.NodeID]*tailcfg.Node
+
+func (f fakePeerByIDBackend) PeerByID(id tailcfg.NodeID) (tailcfg.NodeView, bool) {
+	n, ok := f[id]
+	if !ok {
+		return tailcfg.NodeView{}, false
+	}
+	return n.View(), true
+}
+
+func TestServePeerByID(t *testing.T) {
+	h := handlerForTest(t, &Handler{PermitRead: true})
+	b := fakePeerByIDBackend{
+		42: {
+			ID:   42,
+			Name: "alpha",
+			Addresses: []netip.Prefix{
+				netip.MustParsePrefix("100.64.0.42/32"),
+			},
+		},
+	}
+
+	tests := []struct {
+		name       string
+		query      string
+		wantCode   int
+		wantNodeID tailcfg.NodeID
+	}{
+		{"hit", "id=42", 200, 42},
+		{"miss", "id=99", 404, 0},
+		{"bad_id", "id=garbage", 400, 0},
+		{"missing_id", "", 400, 0},
+		{"zero_id", "id=0", 400, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest("GET", "/v0/peer-by-id?"+tt.query, nil)
+			h.servePeerByIDWithBackend(rec, req, b)
+			if rec.Code != tt.wantCode {
+				t.Fatalf("status = %d, want %d; body=%q", rec.Code, tt.wantCode, rec.Body.String())
+			}
+			if tt.wantCode != 200 {
+				return
+			}
+			var got tailcfg.Node
+			if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+				t.Fatalf("unmarshal body %q: %v", rec.Body.Bytes(), err)
+			}
+			if got.ID != tt.wantNodeID {
+				t.Errorf("Node.ID = %d, want %d", got.ID, tt.wantNodeID)
+			}
+		})
+	}
+
+	t.Run("forbidden", func(t *testing.T) {
+		hh := handlerForTest(t, &Handler{PermitRead: false})
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/v0/peer-by-id?id=42", nil)
+		hh.servePeerByIDWithBackend(rec, req, b)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusForbidden)
+		}
+	})
+}
+
 func TestShouldDenyServeConfigForGOOSAndUserContext(t *testing.T) {
 	newHandler := func(connIsLocalAdmin bool) *Handler {
 		return handlerForTest(t, &Handler{
@@ -497,6 +563,72 @@ func TestServeWithUnhealthyState(t *testing.T) {
 			resp := httptest.NewRecorder()
 			h.ServeHTTP(resp, tt.req)
 			tt.check(t, resp.Code, resp.Body.Bytes())
+		})
+	}
+}
+
+func TestServeDialSelf(t *testing.T) {
+	h := handlerForTest(t, &Handler{
+		PermitRead:  true,
+		PermitWrite: true,
+		b:           newTestLocalBackend(t),
+	})
+
+	tests := []struct {
+		name       string
+		host       string
+		port       string
+		wantSelf   bool
+		wantAddr   string
+		wantStatus int
+	}{
+		{
+			name:       "loopback_v4",
+			host:       "127.0.0.1",
+			port:       "8080",
+			wantSelf:   true,
+			wantAddr:   "127.0.0.1:8080",
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "loopback_v6",
+			host:       "::1",
+			port:       "8080",
+			wantSelf:   true,
+			wantAddr:   "[::1]:8080",
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "localhost",
+			host:       "localhost",
+			port:       "3000",
+			wantSelf:   true,
+			wantStatus: http.StatusOK,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest("POST", "http://local-tailscaled.sock/localapi/v0/dial", nil)
+			req.Header.Set("Connection", "upgrade")
+			req.Header.Set("Upgrade", "ts-dial")
+			req.Header.Set("Dial-Host", tt.host)
+			req.Header.Set("Dial-Port", tt.port)
+			resp := httptest.NewRecorder()
+			h.serveDial(resp, req)
+
+			if resp.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d; body: %s", resp.Code, tt.wantStatus, resp.Body.String())
+			}
+			gotSelf := resp.Header().Get("Dial-Self") == "true"
+			if gotSelf != tt.wantSelf {
+				t.Errorf("Dial-Self = %v, want %v", gotSelf, tt.wantSelf)
+			}
+			if tt.wantAddr != "" {
+				if got := resp.Header().Get("Dial-Addr"); got != tt.wantAddr {
+					t.Errorf("Dial-Addr = %q, want %q", got, tt.wantAddr)
+				}
+			}
 		})
 	}
 }
