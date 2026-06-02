@@ -16,7 +16,7 @@ import (
 	"net/netip"
 	"os"
 	"runtime"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -172,7 +172,7 @@ func WriteRoutes(w *bufio.Writer, routes map[dnsname.FQDN][]*dnstype.Resolver) {
 		}
 		kk = append(kk, k)
 	}
-	sort.Slice(kk, func(i, j int) bool { return kk[i] < kk[j] })
+	slices.Sort(kk)
 	w.WriteByte('{')
 	for i, k := range kk {
 		if i > 0 {
@@ -291,6 +291,18 @@ func (r *Resolver) SetConfig(cfg Config) error {
 	r.ipToHost = reverse
 	r.subdomainHosts = cfg.SubdomainHosts
 	return nil
+}
+
+// CustomSchemeHandler takes a URI (retrieved from [dnstype.Resolver.Addr]) and
+// returns an updated URI to use for the current query. The result is only valid
+// for right now and may change over time.
+type CustomSchemeHandler func(addr string) (newAddr string, err error)
+
+// RegisterCustomScheme adds a [CustomSchemaHandler] that is called to provide
+// an updated address to the forwarder when a [dnstype.Resolver.Addr] uses that
+// scheme.
+func (r *Resolver) RegisterCustomScheme(scheme string, h CustomSchemeHandler) error {
+	return r.forwarder.RegisterCustomScheme(scheme, h)
 }
 
 // Close shuts down the resolver and ensures poll goroutines have exited.
@@ -1402,21 +1414,23 @@ var (
 	metricDNSFwdErrorType = clientmetric.NewCounter("dns_query_fwd_error_type")
 	metricDNSFwdTruncated = clientmetric.NewCounter("dns_query_fwd_truncated")
 
-	metricDNSFwdUDP            = clientmetric.NewCounter("dns_query_fwd_udp")       // on entry
-	metricDNSFwdUDPWrote       = clientmetric.NewCounter("dns_query_fwd_udp_wrote") // sent UDP packet
-	metricDNSFwdUDPErrorWrite  = clientmetric.NewCounter("dns_query_fwd_udp_error_write")
-	metricDNSFwdUDPErrorServer = clientmetric.NewCounter("dns_query_fwd_udp_error_server")
-	metricDNSFwdUDPErrorTxID   = clientmetric.NewCounter("dns_query_fwd_udp_error_txid")
-	metricDNSFwdUDPErrorRead   = clientmetric.NewCounter("dns_query_fwd_udp_error_read")
-	metricDNSFwdUDPSuccess     = clientmetric.NewCounter("dns_query_fwd_udp_success")
+	metricDNSFwdUDP             = clientmetric.NewCounter("dns_query_fwd_udp")       // on entry
+	metricDNSFwdUDPWrote        = clientmetric.NewCounter("dns_query_fwd_udp_wrote") // sent UDP packet
+	metricDNSFwdUDPErrorWrite   = clientmetric.NewCounter("dns_query_fwd_udp_error_write")
+	metricDNSFwdUDPErrorServer  = clientmetric.NewCounter("dns_query_fwd_udp_error_server")
+	metricDNSFwdUDPErrorRefused = clientmetric.NewCounter("dns_query_fwd_udp_error_refused")
+	metricDNSFwdUDPErrorTxID    = clientmetric.NewCounter("dns_query_fwd_udp_error_txid")
+	metricDNSFwdUDPErrorRead    = clientmetric.NewCounter("dns_query_fwd_udp_error_read")
+	metricDNSFwdUDPSuccess      = clientmetric.NewCounter("dns_query_fwd_udp_success")
 
-	metricDNSFwdTCP            = clientmetric.NewCounter("dns_query_fwd_tcp")       // on entry
-	metricDNSFwdTCPWrote       = clientmetric.NewCounter("dns_query_fwd_tcp_wrote") // sent TCP packet
-	metricDNSFwdTCPErrorWrite  = clientmetric.NewCounter("dns_query_fwd_tcp_error_write")
-	metricDNSFwdTCPErrorServer = clientmetric.NewCounter("dns_query_fwd_tcp_error_server")
-	metricDNSFwdTCPErrorTxID   = clientmetric.NewCounter("dns_query_fwd_tcp_error_txid")
-	metricDNSFwdTCPErrorRead   = clientmetric.NewCounter("dns_query_fwd_tcp_error_read")
-	metricDNSFwdTCPSuccess     = clientmetric.NewCounter("dns_query_fwd_tcp_success")
+	metricDNSFwdTCP             = clientmetric.NewCounter("dns_query_fwd_tcp")       // on entry
+	metricDNSFwdTCPWrote        = clientmetric.NewCounter("dns_query_fwd_tcp_wrote") // sent TCP packet
+	metricDNSFwdTCPErrorWrite   = clientmetric.NewCounter("dns_query_fwd_tcp_error_write")
+	metricDNSFwdTCPErrorServer  = clientmetric.NewCounter("dns_query_fwd_tcp_error_server")
+	metricDNSFwdTCPErrorRefused = clientmetric.NewCounter("dns_query_fwd_tcp_error_refused")
+	metricDNSFwdTCPErrorTxID    = clientmetric.NewCounter("dns_query_fwd_tcp_error_txid")
+	metricDNSFwdTCPErrorRead    = clientmetric.NewCounter("dns_query_fwd_tcp_error_read")
+	metricDNSFwdTCPSuccess      = clientmetric.NewCounter("dns_query_fwd_tcp_success")
 
 	metricDNSFwdDoH               = clientmetric.NewCounter("dns_query_fwd_doh")
 	metricDNSFwdDoHErrorStatus    = clientmetric.NewCounter("dns_query_fwd_doh_error_status")

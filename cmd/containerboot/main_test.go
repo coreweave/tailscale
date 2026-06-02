@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -31,6 +32,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"golang.org/x/sys/unix"
+	"tailscale.com/cmd/testwrapper/flakytest"
 	"tailscale.com/health"
 	"tailscale.com/ipn"
 	"tailscale.com/kube/egressservices"
@@ -39,12 +41,12 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest"
 	"tailscale.com/types/netmap"
-	"tailscale.com/types/ptr"
 )
 
 const configFileAuthKey = "some-auth-key"
 
 func TestContainerBoot(t *testing.T) {
+	flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/19380")
 	boot := filepath.Join(t.TempDir(), "containerboot")
 	if err := exec.Command("go", "build", "-ldflags", "-X main.testSleepDuration=1ms", "-o", boot, "tailscale.com/cmd/containerboot").Run(); err != nil {
 		t.Fatalf("Building containerboot: %v", err)
@@ -68,6 +70,12 @@ func TestContainerBoot(t *testing.T) {
 		// initial update for any future new watchers, then wait for all the
 		// Waits below to be true before proceeding to the next phase.
 		Notify *ipn.Notify
+
+		// If non-nil, install this NetMap on the fake LocalAPI before
+		// sending Notify. This is the replacement for the old
+		// Notify.NetMap field; reactive consumers fetch the current
+		// netmap via /localapi/v0/netmap on their own.
+		NetMap *netmap.NetworkMap
 
 		// WantCmds is the commands that containerboot should run in this phase.
 		WantCmds []string
@@ -102,13 +110,11 @@ func TestContainerBoot(t *testing.T) {
 		EndpointStatuses map[string]int
 	}
 	runningNotify := &ipn.Notify{
-		State: ptr.To(ipn.Running),
-		NetMap: &netmap.NetworkMap{
-			SelfNode: (&tailcfg.Node{
-				StableID:  tailcfg.StableNodeID("myID"),
-				Name:      "test-node.test.ts.net.",
-				Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
-			}).View(),
+		State: new(ipn.Running),
+		SelfChange: &tailcfg.Node{
+			StableID:  tailcfg.StableNodeID("myID"),
+			Name:      "test-node.test.ts.net.",
+			Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
 		},
 	}
 	type testCase struct {
@@ -380,24 +386,29 @@ func TestContainerBoot(t *testing.T) {
 					},
 					{
 						Notify: &ipn.Notify{
-							State: ptr.To(ipn.Running),
-							NetMap: &netmap.NetworkMap{
-								SelfNode: (&tailcfg.Node{
-									StableID:  tailcfg.StableNodeID("myID"),
-									Name:      "test-node.test.ts.net.",
-									Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
+							State: new(ipn.Running),
+							SelfChange: &tailcfg.Node{
+								StableID:  tailcfg.StableNodeID("myID"),
+								Name:      "test-node.test.ts.net.",
+								Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
+							},
+						},
+						NetMap: &netmap.NetworkMap{
+							SelfNode: (&tailcfg.Node{
+								StableID:  tailcfg.StableNodeID("myID"),
+								Name:      "test-node.test.ts.net.",
+								Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
+							}).View(),
+							Peers: []tailcfg.NodeView{
+								(&tailcfg.Node{
+									StableID:  tailcfg.StableNodeID("ipv6ID"),
+									Name:      "ipv6-node.test.ts.net.",
+									Addresses: []netip.Prefix{netip.MustParsePrefix("::1/128")},
 								}).View(),
-								Peers: []tailcfg.NodeView{
-									(&tailcfg.Node{
-										StableID:  tailcfg.StableNodeID("ipv6ID"),
-										Name:      "ipv6-node.test.ts.net.",
-										Addresses: []netip.Prefix{netip.MustParsePrefix("::1/128")},
-									}).View(),
-								},
 							},
 						},
 						WantLog:      "no forwarding rules for egress addresses [::1/128], host supports IPv6: false",
-						WantExitCode: ptr.To(1),
+						WantExitCode: new(1),
 					},
 				},
 			}
@@ -416,7 +427,7 @@ func TestContainerBoot(t *testing.T) {
 					},
 					{
 						Notify: &ipn.Notify{
-							State: ptr.To(ipn.NeedsLogin),
+							State: new(ipn.NeedsLogin),
 						},
 						WantCmds: []string{
 							"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false --authkey=tskey-key",
@@ -447,7 +458,7 @@ func TestContainerBoot(t *testing.T) {
 					},
 					{
 						Notify: &ipn.Notify{
-							State: ptr.To(ipn.NeedsLogin),
+							State: new(ipn.NeedsLogin),
 						},
 						WantCmds: []string{
 							"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=true --authkey=tskey-key",
@@ -571,7 +582,7 @@ func TestContainerBoot(t *testing.T) {
 					},
 					{
 						Notify: &ipn.Notify{
-							State: ptr.To(ipn.NeedsLogin),
+							State: new(ipn.NeedsLogin),
 						},
 						WantCmds: []string{
 							"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false --authkey=tskey-key",
@@ -628,14 +639,19 @@ func TestContainerBoot(t *testing.T) {
 					},
 					{
 						Notify: &ipn.Notify{
-							State: ptr.To(ipn.Running),
-							NetMap: &netmap.NetworkMap{
-								SelfNode: (&tailcfg.Node{
-									StableID:  tailcfg.StableNodeID("newID"),
-									Name:      "new-name.test.ts.net.",
-									Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
-								}).View(),
+							State: new(ipn.Running),
+							SelfChange: &tailcfg.Node{
+								StableID:  tailcfg.StableNodeID("newID"),
+								Name:      "new-name.test.ts.net.",
+								Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
 							},
+						},
+						NetMap: &netmap.NetworkMap{
+							SelfNode: (&tailcfg.Node{
+								StableID:  tailcfg.StableNodeID("newID"),
+								Name:      "new-name.test.ts.net.",
+								Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
+							}).View(),
 						},
 						WantKubeSecret: map[string]string{
 							"authkey":           "tskey-key",
@@ -1092,20 +1108,25 @@ func TestContainerBoot(t *testing.T) {
 					},
 					{
 						Notify: &ipn.Notify{
-							State: ptr.To(ipn.Running),
-							NetMap: &netmap.NetworkMap{
-								SelfNode: (&tailcfg.Node{
-									StableID:  tailcfg.StableNodeID("myID"),
-									Name:      "test-node.test.ts.net.",
-									Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
+							State: new(ipn.Running),
+							SelfChange: &tailcfg.Node{
+								StableID:  tailcfg.StableNodeID("myID"),
+								Name:      "test-node.test.ts.net.",
+								Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
+							},
+						},
+						NetMap: &netmap.NetworkMap{
+							SelfNode: (&tailcfg.Node{
+								StableID:  tailcfg.StableNodeID("myID"),
+								Name:      "test-node.test.ts.net.",
+								Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
+							}).View(),
+							Peers: []tailcfg.NodeView{
+								(&tailcfg.Node{
+									StableID:  tailcfg.StableNodeID("fooID"),
+									Name:      "foo.tailnetxyz.ts.net.",
+									Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.2/32")},
 								}).View(),
-								Peers: []tailcfg.NodeView{
-									(&tailcfg.Node{
-										StableID:  tailcfg.StableNodeID("fooID"),
-										Name:      "foo.tailnetxyz.ts.net.",
-										Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.2/32")},
-									}).View(),
-								},
 							},
 						},
 						WantKubeSecret: map[string]string{
@@ -1132,7 +1153,7 @@ func TestContainerBoot(t *testing.T) {
 				Phases: []phase{
 					{
 						WantLog:      "TS_EGRESS_PROXIES_CONFIG_PATH is only supported for Tailscale running on Kubernetes",
-						WantExitCode: ptr.To(1),
+						WantExitCode: new(1),
 					},
 				},
 			}
@@ -1181,7 +1202,7 @@ func TestContainerBoot(t *testing.T) {
 					{
 						// SIGTERM before state is finished writing, should wait for
 						// consistent state before propagating SIGTERM to tailscaled.
-						Signal: ptr.To(unix.SIGTERM),
+						Signal: new(unix.SIGTERM),
 						UpdateKubeSecret: map[string]string{
 							"_machinekey":  "foo",
 							"_profiles":    "foo",
@@ -1211,7 +1232,7 @@ func TestContainerBoot(t *testing.T) {
 							kubetypes.KeyCapVer: capver,
 						},
 						WantLog:      "HTTP server at [::]:9002 closed",
-						WantExitCode: ptr.To(0),
+						WantExitCode: new(0),
 					},
 				},
 			}
@@ -1273,6 +1294,18 @@ func TestContainerBoot(t *testing.T) {
 					if err := os.Chtimes(fullPath, now, now); err != nil {
 						t.Fatalf("phase %d: updating mtime for %q: %v", i, path, err)
 					}
+				}
+				nmForFake := p.NetMap
+				if nmForFake == nil && p.Notify != nil && p.Notify.SelfChange != nil {
+					// Synthesize a minimal netmap from SelfChange so
+					// containerboot's NetMap() fetch returns
+					// something usable when the test only set Notify.
+					nmForFake = &netmap.NetworkMap{
+						SelfNode: p.Notify.SelfChange.View(),
+					}
+				}
+				if nmForFake != nil {
+					env.lapi.SetNetMap(nmForFake)
 				}
 				env.lapi.Notify(p.Notify)
 				if p.Signal != nil {
@@ -1396,7 +1429,7 @@ func (b *lockingBuffer) String() string {
 func waitLogLine(t *testing.T, timeout time.Duration, b *lockingBuffer, want string) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		for _, line := range strings.Split(b.String(), "\n") {
+		for line := range strings.SplitSeq(b.String(), "\n") {
 			if !strings.HasPrefix(line, "boot: ") {
 				continue
 			}
@@ -1466,6 +1499,7 @@ type localAPI struct {
 	sync.Mutex
 	cond   *sync.Cond
 	notify *ipn.Notify
+	netmap *netmap.NetworkMap // served by /localapi/v0/netmap
 }
 
 func (lc *localAPI) Start() error {
@@ -1502,8 +1536,44 @@ func (lc *localAPI) Notify(n *ipn.Notify) {
 	lc.cond.Broadcast()
 }
 
+// SetNetMap installs the netmap that the fake /localapi/v0/netmap endpoint
+// will return.
+func (lc *localAPI) SetNetMap(nm *netmap.NetworkMap) {
+	lc.Lock()
+	defer lc.Unlock()
+	lc.netmap = nm
+}
+
 func (lc *localAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
+	case "/localapi/v0/netmap":
+		w.Header().Set("Content-Type", "application/json")
+		lc.Lock()
+		nm := lc.netmap
+		lc.Unlock()
+		if nm == nil {
+			http.Error(w, "no netmap", http.StatusServiceUnavailable)
+			return
+		}
+		json.NewEncoder(w).Encode(nm)
+		return
+	case "/localapi/v0/debug":
+		// containerboot fetches the netmap via the "current-netmap"
+		// debug action; serve it like /localapi/v0/netmap above.
+		if r.URL.Query().Get("action") != "current-netmap" {
+			http.Error(w, "unsupported debug action", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		lc.Lock()
+		nm := lc.netmap
+		lc.Unlock()
+		if nm == nil {
+			http.Error(w, "no netmap", http.StatusServiceUnavailable)
+			return
+		}
+		json.NewEncoder(w).Encode(nm)
+		return
 	case "/localapi/v0/serve-config":
 		switch r.Method {
 		case "GET":
@@ -1592,9 +1662,7 @@ func (k *kubeServer) Secret() map[string]string {
 	k.Lock()
 	defer k.Unlock()
 	ret := map[string]string{}
-	for k, v := range k.secret {
-		ret[k] = v
-	}
+	maps.Copy(ret, k.secret)
 	return ret
 }
 

@@ -51,9 +51,10 @@ import (
 )
 
 var (
-	debugCaptureCmd   func() *ffcli.Command // or nil
-	debugPortmapCmd   func() *ffcli.Command // or nil
-	debugPeerRelayCmd func() *ffcli.Command // or nil
+	debugCaptureCmd          func() *ffcli.Command // or nil
+	debugPortmapCmd          func() *ffcli.Command // or nil
+	debugPeerRelayCmd        func() *ffcli.Command // or nil
+	debugClearNetmapCacheCmd func() *ffcli.Command // or nil
 )
 
 func debugCmd() *ffcli.Command {
@@ -387,7 +388,14 @@ func debugCmd() *ffcli.Command {
 					return fs
 				})(),
 			},
+			{
+				Name:       "statedir",
+				ShortUsage: "tailscale debug statedir",
+				ShortHelp:  "Print the location of the state directory (if any)",
+				Exec:       runPrintStateDir,
+			},
 			ccall(debugPeerRelayCmd),
+			ccall(debugClearNetmapCacheCmd),
 		}...),
 	}
 }
@@ -662,18 +670,11 @@ func runNetmap(ctx context.Context, args []string) error {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	var mask ipn.NotifyWatchOpt = ipn.NotifyInitialNetMap
-	watcher, err := localClient.WatchIPNBus(ctx, mask)
+	raw, err := localClient.DebugResultJSON(ctx, "current-netmap")
 	if err != nil {
 		return err
 	}
-	defer watcher.Close()
-
-	n, err := watcher.Next()
-	if err != nil {
-		return err
-	}
-	j, _ := json.MarshalIndent(n.NetMap, "", "\t")
+	j, _ := json.MarshalIndent(raw, "", "\t")
 	fmt.Printf("%s\n", j)
 	return nil
 }
@@ -1406,4 +1407,23 @@ func runTestRisk(ctx context.Context, args []string) error {
 	}
 	fmt.Println("did-test-risky-action")
 	return nil
+}
+
+func runPrintStateDir(ctx context.Context, args []string) error {
+	if len(args) > 0 {
+		return errors.New("unexpected arguments")
+	}
+	v, err := localClient.DebugResultJSON(ctx, "statedir")
+	if err != nil {
+		return err
+	}
+	statedir, ok := v.(string)
+	if ok && statedir != "" {
+		fmt.Println(statedir)
+		return nil
+	} else if ok && statedir == "" {
+		return errors.New("no statedir is set")
+	} else {
+		return fmt.Errorf("got unexpected response from debug API: %v", v)
+	}
 }
