@@ -1251,6 +1251,47 @@ func delReturnChromeOSVMRangeRule(c *nftables.Conn, table *nftables.Table, chain
 	return nil
 }
 
+// addReturnCGNATOverrideRanges adds a RETURN rule for each CGNAT override range
+// configured via TS_CGNAT_OVERRIDE_RANGE (see cgnatReturnRanges), so inbound
+// off-Tailscale traffic in those ranges falls out of the Tailscale chain rather
+// than being dropped by the CGNAT drop rule.
+func addReturnCGNATOverrideRanges(c *nftables.Conn, table *nftables.Table, chain *nftables.Chain, tunname string) error {
+	for _, p := range cgnatReturnRanges() {
+		rule, err := createRangeRule(table, chain, tunname, p, expr.VerdictReturn)
+		if err != nil {
+			return fmt.Errorf("create rule for %v: %w", p, err)
+		}
+		_ = c.AddRule(rule)
+		if err = c.Flush(); err != nil {
+			return fmt.Errorf("add rule for %v: %w", p, err)
+		}
+	}
+	return nil
+}
+
+// delReturnCGNATOverrideRanges deletes the rules created by
+// addReturnCGNATOverrideRanges, if they exist.
+func delReturnCGNATOverrideRanges(c *nftables.Conn, table *nftables.Table, chain *nftables.Chain, tunname string) error {
+	for _, p := range cgnatReturnRanges() {
+		rule, err := createRangeRule(table, chain, tunname, p, expr.VerdictReturn)
+		if err != nil {
+			return fmt.Errorf("create rule for %v: %w", p, err)
+		}
+		rule, err = findRule(c, rule)
+		if err != nil {
+			return fmt.Errorf("find rule for %v: %v", p, err)
+		}
+		if rule == nil {
+			continue
+		}
+		_ = c.DelRule(rule)
+		if err := c.Flush(); err != nil {
+			return fmt.Errorf("flush del rule for %v: %w", p, err)
+		}
+	}
+	return nil
+}
+
 // addDropCGNATRangeRule adds a rule to drop if the source IP is in the
 // CGNAT range.
 func addDropCGNATRangeRule(c *nftables.Conn, table *nftables.Table, chain *nftables.Chain, tunname string) error {
@@ -1603,6 +1644,9 @@ func (n *nftablesRunner) AddExternalCGNATRules(mode CGNATMode, tunname string) e
 		if err = addReturnChromeOSVMRangeRule(conn, n.nft4.Filter, inputChain, tunname); err != nil {
 			return fmt.Errorf("add return chromeos vm range rule v4: %w", err)
 		}
+		if err = addReturnCGNATOverrideRanges(conn, n.nft4.Filter, inputChain, tunname); err != nil {
+			return fmt.Errorf("add return cgnat override ranges v4: %w", err)
+		}
 		if err = addDropCGNATRangeRule(conn, n.nft4.Filter, inputChain, tunname); err != nil {
 			return fmt.Errorf("add drop cgnat range rule v4: %w", err)
 		}
@@ -1632,6 +1676,9 @@ func (n *nftablesRunner) DelExternalCGNATRules(mode CGNATMode, tunname string) e
 	case CGNATModeDrop:
 		if err = delReturnChromeOSVMRangeRule(conn, n.nft4.Filter, inputChain, tunname); err != nil {
 			return fmt.Errorf("del return chromeos vm range rule v4: %w", err)
+		}
+		if err = delReturnCGNATOverrideRanges(conn, n.nft4.Filter, inputChain, tunname); err != nil {
+			return fmt.Errorf("del return cgnat override ranges v4: %w", err)
 		}
 		if err = delDropCGNATRangeRule(conn, n.nft4.Filter, inputChain, tunname); err != nil {
 			return fmt.Errorf("del drop cgnat range rule v4: %w", err)
