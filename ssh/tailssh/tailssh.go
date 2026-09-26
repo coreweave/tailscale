@@ -39,6 +39,7 @@ import (
 	"tailscale.com/net/tsdial"
 	"tailscale.com/sessionrecording"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tstime"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
@@ -46,6 +47,7 @@ import (
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/httpm"
 	"tailscale.com/util/mak"
+	"tailscale.com/version/distro"
 )
 
 var (
@@ -479,7 +481,7 @@ func (srv *server) newConn() (*conn, error) {
 	srv.mu.Unlock()
 	c := &conn{srv: srv}
 	now := srv.now()
-	c.connID = fmt.Sprintf("ssh-conn-%s-%02x", now.UTC().Format("20060102T150405"), randBytes(5))
+	c.connID = fmt.Sprintf("ssh-conn-%s-%02x", now.UTC().Format(tstime.BasicDateTTime), randBytes(5))
 	fwdHandler := &gliderssh.ForwardedTCPHandler{}
 	streamLocalFwdHandler := &gliderssh.ForwardedUnixHandler{}
 	c.Server = &gliderssh.Server{
@@ -769,6 +771,35 @@ type sshSession struct {
 	exitHandled chan struct{}
 }
 
+// forwardedEnvChildFD is the fd the incubator child reads the forwarded environment from, sent via
+// --env-fd. It must match the payload file's index in launchProcess's ExtraFiles (fd = 3 + index).
+const forwardedEnvChildFD = 3
+
+// forwardedEnvFile returns the read end of a pipe holding the JSON-encoded forwarded pairs.
+// The read end is passed to the incubator child via exec.Cmd.ExtraFiles to communicate
+// secrets and config; the payload only ever exists in memory, never on any filesystem. A
+// goroutine writes the payload and closes the write end. Caller must close the read end
+// after the child starts.
+func forwardedEnvFile(forwardedEnv []string) (*os.File, error) {
+	if len(forwardedEnv) == 0 {
+		return nil, errors.New("no forwarded environment")
+	}
+	b, err := json.Marshal(forwardedEnv)
+	if err != nil {
+		return nil, fmt.Errorf("marshaling forwarded environment: %w", err)
+	}
+	r, w, err := os.Pipe()
+	if err != nil {
+		return nil, fmt.Errorf("creating forwarded environment pipe: %w", err)
+	}
+	go func() {
+		defer w.Close()
+		// A short read fails the session child-side
+		_, _ = w.Write(b)
+	}()
+	return r, nil
+}
+
 func (ss *sshSession) vlogf(format string, args ...any) {
 	if sshVerboseLogging() {
 		ss.logf(format, args...)
@@ -776,7 +807,7 @@ func (ss *sshSession) vlogf(format string, args ...any) {
 }
 
 func (c *conn) newSSHSession(s gliderssh.Session) *sshSession {
-	sharedID := fmt.Sprintf("sess-%s-%02x", c.srv.now().UTC().Format("20060102T150405"), randBytes(5))
+	sharedID := fmt.Sprintf("sess-%s-%02x", c.srv.now().UTC().Format(tstime.BasicDateTTime), randBytes(5))
 	c.logf("starting session: %v", sharedID)
 	ctx, cancel := context.WithCancelCause(s.Context())
 	return &sshSession{
@@ -1254,6 +1285,22 @@ func mapLocalUser(ruleSSHUsers map[string]string, reqSSHUser string) (localUser 
 		v = ruleSSHUsers["*"]
 	}
 	if v == "=" {
+		// Skip lookup for gokrazy as we intentionally fall back to a synthesized
+		// root user there when user lookup fails.
+		if distro.Get() == distro.Gokrazy {
+			return reqSSHUser
+		}
+
+		// Immediately look up user information for purposes of generating
+		// hold and delegate URL (if necessary).
+		lu, err := userLookup(reqSSHUser)
+		if err != nil {
+			return ""
+		}
+		// Don't match as root for autogroup:nonroot
+		if lu.Uid == "0" || lu.Username == "root" {
+			return ""
+		}
 		return reqSSHUser
 	}
 	return v

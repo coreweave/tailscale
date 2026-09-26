@@ -7,7 +7,7 @@
 // and multi-NIC configurations for scenarios like subnet routing.
 //
 // Prerequisites:
-//   - qemu-system-x86_64 and KVM access (typically the "kvm" group; no root required)
+//   - qemu-system-x86_64 (KVM is used automatically on Linux when /dev/kvm is accessible)
 //   - A built gokrazy natlabapp image (auto-built on first run via "make natlab" in gokrazy/)
 //
 // Run tests with:
@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -38,6 +39,9 @@ import (
 	"time"
 
 	"github.com/google/gopacket/layers"
+	dto "github.com/prometheus/client_model/go"
+	"github.com/prometheus/common/expfmt"
+	"github.com/prometheus/common/model"
 	"go4.org/mem"
 	"golang.org/x/sync/errgroup"
 	"tailscale.com/client/local"
@@ -52,7 +56,7 @@ import (
 )
 
 var (
-	runVMTests     = flag.Bool("run-vm-tests", false, "run tests that require VMs with KVM")
+	runVMTests     = flag.Bool("run-vm-tests", false, "run tests that require QEMU VMs")
 	verboseVMDebug = flag.Bool("verbose-vm-debug", false, "enable verbose debug logging for VM tests")
 	testVersion    = flag.String("test-version", "", `if non-empty, download tailscale & tailscaled at the given release version (e.g. "1.97.255", "unstable", or "stable") instead of building from the source tree`)
 )
@@ -66,6 +70,7 @@ type Env struct {
 	nodes   []*Node
 	tempDir string
 
+	sockDir       string // short-path dir for Unix sockets (macOS has 104-byte limit)
 	sockAddr      string // shared Unix socket path for all QEMU netdevs
 	dgramSockAddr string // Unix dgram socket path for macOS VMs (tailmac)
 	binDir        string // directory for compiled binaries
@@ -86,8 +91,14 @@ type Env struct {
 
 	qemuProcs []*exec.Cmd // launched QEMU processes
 
-	sameTailnetUser bool // all nodes register as the same Tailnet user
-	allOnline       bool // mark every peer as Online=true in MapResponses
+	sameTailnetUser           bool // all nodes register as the same Tailnet user
+	allOnline                 bool // mark every peer as Online=true in MapResponses
+	peerRelayGrants           bool // grant peer-relay capabilities on the wildcard packet filter
+	selfSignedDERPCertPinning bool // serve test DERP map with sha256-raw cert pins
+	fakeACME                  bool // point tailscaled at vnet's fake ACME server
+
+	controlDNSDomain string             // MagicDNS domain for the test control server (see ControlDNS)
+	controlDNS       *tailcfg.DNSConfig // DNS config for the test control server (see ControlDNS)
 
 	// Shared resource initialization (sync.Once for things multiple nodes share).
 	vnetOnce      sync.Once
@@ -310,9 +321,20 @@ func New(t testing.TB, opts ...EnvOption) *Env {
 	}
 
 	tempDir := t.TempDir()
+
+	// Unix sockets have a short path limit (104 bytes on macOS). The Go
+	// test TempDir path easily exceeds that, so create a dedicated short
+	// directory under /tmp for sockets.
+	sockDir, err := os.MkdirTemp("", "vmtest")
+	if err != nil {
+		t.Fatalf("creating socket tempdir: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+
 	e := &Env{
 		t:          t,
 		tempDir:    tempDir,
+		sockDir:    sockDir,
 		binDir:     filepath.Join(tempDir, "bin"),
 		eventBus:   newEventBus(),
 		testStatus: newTestStatus(),
@@ -359,10 +381,54 @@ func AllOnline() EnvOption {
 	return envOptFunc(func(e *Env) { e.allOnline = true })
 }
 
+// PeerRelayGrants returns an [EnvOption] that makes the test control server
+// grant [tailcfg.PeerCapabilityRelay] and [tailcfg.PeerCapabilityRelayTarget]
+// on the wildcard packet filter (testcontrol.Server.PeerRelayGrants). Without
+// those capabilities, magicsock does not consider any peer a candidate
+// peer-relay server, so a node that has [ipn.Prefs.RelayServerPort] set
+// cannot actually be used as a relay by its peers.
+func PeerRelayGrants() EnvOption {
+	return envOptFunc(func(e *Env) { e.peerRelayGrants = true })
+}
+
+// SelfSignedDERPCertPinning returns an [EnvOption] that makes the test control
+// server advertise a DERP map whose nodes use CertName="sha256-raw:<hex>"
+// pinning against the self-signed certs vnet's fake DERP servers serve. This
+// exercises the sha256-raw verification path end-to-end (in tailscaled and in
+// `tailscale debug derp`) without involving a real CA.
+func SelfSignedDERPCertPinning() EnvOption {
+	return envOptFunc(func(e *Env) { e.selfSignedDERPCertPinning = true })
+}
+
+// FakeACME returns an [EnvOption] that points nodes at vnet's in-process ACME
+// CA and configures the test control server to advertise MagicDNS cert domains.
+func FakeACME() EnvOption {
+	return envOptFunc(func(e *Env) { e.fakeACME = true })
+}
+
+// ControlDNS returns an [EnvOption] that makes the test control server send
+// the given DNS configuration in MapResponses, with node names placed under
+// the given MagicDNS domain (e.g. "tailnet.test").
+func ControlDNS(magicDNSDomain string, cfg *tailcfg.DNSConfig) EnvOption {
+	return envOptFunc(func(e *Env) {
+		e.controlDNSDomain = magicDNSDomain
+		e.controlDNS = cfg
+	})
+}
+
 // AddNetwork creates a new virtual network. Arguments follow the same pattern as
 // vnet.Config.AddNetwork (string IPs, NAT types, NetworkService values).
 func (e *Env) AddNetwork(opts ...any) *vnet.Network {
 	return e.cfg.AddNetwork(opts...)
+}
+
+// RegisterFile registers a file with the vnet fileserver.
+// It is served at http://files.tailscale/<path>.
+func (e *Env) RegisterFile(path string, data []byte) {
+	if e.server == nil {
+		e.t.Fatalf("RegisterFile called before Start")
+	}
+	e.server.RegisterFile(path, data)
 }
 
 // Node represents a virtual machine in the test environment.
@@ -375,11 +441,14 @@ type Node struct {
 	vnetNode         *vnet.Node // primary vnet node (set during Start)
 	agent            *vnet.NodeAgentClient
 	joinTailnet      bool
+	runSSH           bool // true to enable the node's Tailscale SSH server
 	noAgent          bool // true to skip TTA agent setup (e.g. macOS VMs without TTA)
+	systemdUnit      bool // true to run tailscaled via the stock systemd unit (Linux cloud VMs only)
 	advertiseRoutes  string
 	snatSubnetRoutes *bool // nil means default (true)
 	webServerPort    int
-	sshPort          int // host port for SSH debug access (cloud VMs only)
+	sshPort          int     // host port for SSH debug access (cloud VMs only)
+	dnsMode          DNSMode // desired Linux DNS backend to provision; "" means the image default
 }
 
 // AddNode creates a new VM node. The name is used for identification and as the
@@ -405,8 +474,12 @@ func (e *Env) AddNode(name string, opts ...any) *Node {
 		case nodeOptNoTailscale:
 			n.joinTailnet = false
 			vnetOpts = append(vnetOpts, vnet.DontJoinTailnet)
+		case nodeOptTailscaleSSH:
+			n.runSSH = true
 		case nodeOptNoAgent:
 			n.noAgent = true
+		case nodeOptSystemdUnit:
+			n.systemdUnit = true
 		case nodeOptAdvertiseRoutes:
 			n.advertiseRoutes = string(o)
 		case nodeOptSNATSubnetRoutes:
@@ -414,10 +487,40 @@ func (e *Env) AddNode(name string, opts ...any) *Node {
 			n.snatSubnetRoutes = &v
 		case nodeOptWebServer:
 			n.webServerPort = int(o)
+		case nodeOptDNSMode:
+			switch DNSMode(o) {
+			case DNSDefault, DNSDirect:
+			default:
+				e.t.Fatalf("AddNode(%q): unsupported DNSMode %q", name, DNSMode(o))
+			}
+			n.dnsMode = DNSMode(o)
 		default:
 			// Pass through to vnet (TailscaledEnv, NodeOption, MAC, etc.)
 			vnetOpts = append(vnetOpts, o)
 		}
+	}
+	if e.fakeACME {
+		vnetOpts = append(vnetOpts, vnet.TailscaledEnv{
+			Key:   "TS_DEBUG_ACME_DIRECTORY_URL",
+			Value: "http://acme.example/directory",
+		})
+	}
+
+	if n.systemdUnit && (n.os.IsGokrazy || n.os.GOOS() != "linux") {
+		e.t.Fatalf("SystemdUnit is only supported on Linux cloud VMs; node %s is %s", name, n.os.Name)
+	}
+
+	// macOS VMs require a macOS arm64 host (Apple Virtualization.framework via
+	// tailmac). Skip the test now rather than letting it proceed through the
+	// rest of the setup only to fail later.
+	if n.os.IsMacOS && (runtime.GOOS != "darwin" || runtime.GOARCH != "arm64") {
+		e.t.Skipf("macOS VM tests require a macOS arm64 host (got %s/%s)", runtime.GOOS, runtime.GOARCH)
+	}
+
+	// Linux cloud images must declare a family; it drives distro-specific
+	// cloud-init provisioning. gokrazy and non-Linux images don't use that path.
+	if n.os.isLinuxCloudImage() && n.os.Family == "" {
+		e.t.Fatalf("AddNode(%q): Linux cloud image %q has no LinuxFamily set", name, n.os.Name)
 	}
 
 	n.vnetNode = e.cfg.AddNode(vnetOpts...)
@@ -425,25 +528,58 @@ func (e *Env) AddNode(name string, opts ...any) *Node {
 	return n
 }
 
-// LanIP returns the LAN IPv4 address of this node on the given network.
-// This is only valid after Env.Start() has been called.
-// Name returns the node's name as set in [Env.AddNode].
+// Name returns the name of the Node.
 func (n *Node) Name() string {
 	return n.name
 }
 
+// LanIP returns the LAN IPv4 address of this node on the given network.
+// This is only valid after Env.Start() has been called.
+// Name returns the node's name as set in [Env.AddNode].
 func (n *Node) LanIP(net *vnet.Network) netip.Addr {
 	return n.vnetNode.LanIP(net)
+}
+
+// DropControlTraffic sets up a blackhole for control traffic for just this
+// node on all the networks belonging to the node.
+func (n *Node) DropControlTraffic() {
+	for _, network := range n.nets {
+		network.BlackholeControlForAddr(n.LanIP(network))
+	}
 }
 
 // NodeOption types for configuring nodes.
 
 type nodeOptOS OSImage
 type nodeOptNoTailscale struct{}
+type nodeOptTailscaleSSH struct{}
 type nodeOptNoAgent struct{}
+type nodeOptSystemdUnit struct{}
 type nodeOptAdvertiseRoutes string
 type nodeOptSNATSubnetRoutes bool
 type nodeOptWebServer int
+type nodeOptDNSMode DNSMode
+
+// DNSMode is a provisioning directive, not a DNS-backend name: it says what, if
+// anything, to do to the guest's DNS before tailscaled starts, letting one
+// distro image cover multiple backends. DNSDefault leaves DNS untouched (the
+// resulting backend is image-dependent); the other modes provision the guest to
+// force a specific backend, and are named to match the mode strings in
+// net/dns/manager_linux.go so the result can be checked with
+// [Env.AssertDNSBackend].
+type DNSMode string
+
+const (
+	// DNSDefault leaves the image's DNS configuration untouched, so the backend
+	// is whatever the image runs by default (typically systemd-resolved on
+	// modern distros). It has no [Env.AssertDNSBackend] counterpart because the
+	// result isn't forced.
+	DNSDefault DNSMode = ""
+
+	// DNSDirect masks systemd-resolved and installs a plain /etc/resolv.conf
+	// so tailscaled selects the "direct" manager (rewrites resolv.conf itself).
+	DNSDirect DNSMode = "direct"
+)
 
 // OS returns a NodeOption that sets the node's operating system image.
 func OS(img OSImage) nodeOptOS { return nodeOptOS(img) }
@@ -451,10 +587,25 @@ func OS(img OSImage) nodeOptOS { return nodeOptOS(img) }
 // DontJoinTailnet returns a NodeOption that prevents the node from running tailscale up.
 func DontJoinTailnet() nodeOptNoTailscale { return nodeOptNoTailscale{} }
 
+// TailscaleSSH returns a NodeOption that enables the node's Tailscale SSH
+// server by passing --ssh to tailscale up. If any node has this option, the
+// test control server is configured with a permissive SSH policy that lets
+// any tailnet node connect as any SSH user, mapped to the same-named local
+// user.
+func TailscaleSSH() nodeOptTailscaleSSH { return nodeOptTailscaleSSH{} }
+
 // NoAgent returns a NodeOption that skips TTA agent setup. The node will not
 // have a test agent, so agent-dependent operations (Status, ExecOnNode, etc.)
 // won't work. Useful for VMs that just need to boot and respond to ICMP.
 func NoAgent() nodeOptNoAgent { return nodeOptNoAgent{} }
+
+// SystemdUnit returns a NodeOption that makes the node run tailscaled via the
+// stock systemd unit that Linux packages ship (cmd/tailscaled/tailscaled.service
+// with cmd/tailscaled/tailscaled.defaults as its EnvironmentFile), instead of
+// launching tailscaled directly as a background process. This exercises the
+// unit's sandboxing directives and its Type=notify readiness handshake.
+// It is only supported on Linux cloud VMs (e.g. Ubuntu, Debian).
+func SystemdUnit() nodeOptSystemdUnit { return nodeOptSystemdUnit{} }
 
 // AdvertiseRoutes returns a NodeOption that configures the node to advertise
 // the given routes (comma-separated CIDRs) when joining the tailnet.
@@ -472,10 +623,22 @@ func SNATSubnetRoutes(v bool) nodeOptSNATSubnetRoutes { return nodeOptSNATSubnet
 // The webserver responds with "Hello world I am <nodename> from <sourceIP>" on all requests.
 func WebServer(port int) nodeOptWebServer { return nodeOptWebServer(port) }
 
+// WithDNSMode returns a NodeOption that provisions the (Linux) node so
+// tailscaled selects the given DNS backend. Only meaningful for Linux cloud
+// images; ignored for gokrazy/macOS. See [DNSMode].
+func WithDNSMode(m DNSMode) nodeOptDNSMode { return nodeOptDNSMode(m) }
+
 // Start initializes the virtual network, boots all VMs in parallel, and waits
 // for all TTA agents to connect. It should be called after all AddNetwork/AddNode calls.
 func (e *Env) Start() {
 	t := e.t
+
+	// Give bring-up (image build, boot, agent wait) a generous budget measured
+	// from now. We deliberately do NOT derive this from the test deadline: on
+	// CI, per-test timeouts can be tight (a few minutes), and reserving headroom
+	// under the deadline was observed to steal time bring-up legitimately needs,
+	// failing slow-but-healthy runs. If bring-up genuinely exceeds this, the
+	// `go test -timeout` panic is an acceptable (if blunt) backstop.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	t.Cleanup(cancel)
 	e.ctx = ctx
@@ -494,12 +657,6 @@ func (e *Env) Start() {
 		}
 		e.testVersion = v
 		t.Logf("using Tailscale release version %s (from --test-version=%q)", v, *testVersion)
-	}
-
-	for _, n := range e.nodes {
-		if n.os.IsMacOS && (runtime.GOOS != "darwin" || runtime.GOARCH != "arm64") {
-			t.Skip("macOS VM tests require macOS arm64 host")
-		}
 	}
 
 	// Dry-run: let each platform register its steps with the web UI.
@@ -524,7 +681,14 @@ func (e *Env) Start() {
 	// Boot all nodes in parallel. Each platform handles its own
 	// dependencies (image prep, binary compilation, socket setup)
 	// via sync.Once, so independent work overlaps naturally.
+	//
+	// Under TCG, concurrent boots oversubscribe the host CPUs and a heavy
+	// guest can starve its siblings past the stuck-detector; serialize boots
+	// there so each clears that gate before the next starts. KVM stays parallel.
 	var bootEg errgroup.Group
+	if !hardwareAccelAvailable() {
+		bootEg.SetLimit(1)
+	}
 	for _, n := range e.nodes {
 		bootEg.Go(func() error {
 			return n.platform().boot(ctx, e, n)
@@ -639,6 +803,9 @@ func (e *Env) tailscaleUp(ctx context.Context, n *Node) error {
 	url := "http://unused/up?accept-routes=true"
 	if n.advertiseRoutes != "" {
 		url += "&advertise-routes=" + n.advertiseRoutes
+	}
+	if n.runSSH {
+		url += "&ssh=true"
 	}
 	if n.snatSubnetRoutes != nil {
 		if *n.snatSubnetRoutes {
@@ -756,6 +923,12 @@ func (e *Env) ControlServer() *testcontrol.Server {
 	return e.server.ControlServer()
 }
 
+// FakeACMERootPEM returns the root certificate for vnet's fake ACME CA.
+func (e *Env) FakeACMERootPEM() []byte {
+	e.initVnet()
+	return e.server.FakeACMERootPEM()
+}
+
 // BringUpMullvadWGServer brings up a userspace WireGuard server on n,
 // configured as a single-peer "Mullvad-style" exit-node target. The
 // server runs inside n's TTA process on a Linux TUN named "wg0".
@@ -797,7 +970,7 @@ func (e *Env) BringUpMullvadWGServer(n *Node, gw netip.Prefix, listenPort uint16
 		e.t.Fatalf("BringUpMullvadWGServer(%s): %s: %s", n.name, res.Status, body)
 	}
 	var pubB64 string
-	for _, line := range strings.Split(string(body), "\n") {
+	for line := range strings.SplitSeq(string(body), "\n") {
 		if s, ok := strings.CutPrefix(strings.TrimSpace(line), "PUBKEY="); ok {
 			pubB64 = s
 			break
@@ -824,6 +997,107 @@ func (e *Env) Status(n *Node) *ipnstate.Status {
 		e.t.Fatalf("Status(%s): %v", n.name, err)
 	}
 	return st
+}
+
+// ClientMetrics returns the client metrics exported by the given node.
+func (e *Env) ClientMetrics(n *Node) ClientMetrics {
+	e.t.Helper()
+	raw, err := n.Agent().DaemonMetrics(e.t.Context())
+	if err != nil {
+		e.t.Fatalf("Node %q DaemonMetrics: %v", n.Name(), err)
+	}
+
+	// Metrics are reported in Prometheus exposition format.
+	// prometheus/common v0.67 made the validation scheme mandatory;
+	// the zero-value parser now panics. LegacyValidation matches the
+	// classic ASCII metric/label name rules that the tailscaled
+	// client exporter uses.
+	parser := expfmt.NewTextParser(model.LegacyValidation)
+	mfs, err := parser.TextToMetricFamilies(bytes.NewReader(raw))
+	if err != nil {
+		e.t.Fatalf("Node %q parse client metrics: %v", n.Name(), err)
+	}
+
+	// Tailscale client metrics are all unlabelled integer-valued counters and
+	// gauges, so we don't need to handle the full generality of the Prometheus
+	// representation. If we see anything else, we'll log and skip it.
+	out := make(ClientMetrics)
+	for _, mf := range mfs {
+		name := mf.GetName()
+		if _, ok := out[name]; ok {
+			e.t.Logf("Node %q: duplicate client metric %q (ignored)", n.Name(), name)
+			continue
+		} else if len(mf.Metric) != 1 {
+			e.t.Logf("Node %q: got %d values for client metric %q, want 1 (ignored)", n.Name(), len(mf.Metric), name)
+			continue
+		}
+
+		var mtype string
+		var value int64
+		switch mf.GetType() {
+		case dto.MetricType_COUNTER:
+			mtype = "counter"
+			value = int64(mf.Metric[0].GetCounter().GetValue())
+		case dto.MetricType_GAUGE:
+			mtype = "gauge"
+			value = int64(mf.Metric[0].GetGauge().GetValue())
+		default:
+			e.t.Logf("Node %q unexpected client metric %q type %q (ignored)", n.Name(), name, mf.GetType().String())
+			continue
+		}
+		out[name] = ClientMetric{
+			Name:  name,
+			Type:  mtype,
+			Value: value,
+		}
+	}
+	return out
+}
+
+// dnsBackendMetricPrefix is the prefix of the clientmetric gauge that
+// tailscaled sets to 1 for the Linux DNS mode it selected. See
+// net/dns/manager_linux.go.
+const dnsBackendMetricPrefix = "dns_manager_linux_mode_"
+
+// DNSBackend returns the Linux DNS backend ("mode") the node's tailscaled
+// selected (e.g. "systemd-resolved", "direct"). tailscaled sets a single gauge
+// named dns_manager_linux_mode_<mode> to 1 for its selected mode (see
+// net/dns/manager_linux.go); this finds that gauge and returns <mode>. It fails
+// the test if none is set (non-Linux node, or DNS not yet configured).
+func (e *Env) DNSBackend(n *Node) string {
+	e.t.Helper()
+	for name, m := range e.ClientMetrics(n) {
+		mode, ok := strings.CutPrefix(name, dnsBackendMetricPrefix)
+		if !ok || m.Value != 1 {
+			continue
+		}
+		// tailscaled sanitizes "-" to "_" when forming the metric name;
+		// reverse it so we return net/dns's spelling ("systemd-resolved").
+		return strings.ReplaceAll(mode, "_", "-")
+	}
+	e.t.Fatalf("Node %q: no %s* gauge set (non-Linux node, or DNS not yet configured)", n.Name(), dnsBackendMetricPrefix)
+	return ""
+}
+
+// AssertDNSBackend fails the test unless the node's selected Linux DNS backend
+// matches want (see [Env.DNSBackend] for the mode strings). Use it in distro
+// tests to prove the node exercises the intended DNS manager.
+func (e *Env) AssertDNSBackend(n *Node, want string) {
+	e.t.Helper()
+	if got := e.DNSBackend(n); got != want {
+		e.t.Fatalf("Node %q: DNS backend = %q, want %q", n.Name(), got, want)
+	}
+}
+
+// ClientMetrics is a view of the client metrics exported by a node.
+// The keys of the map are the metric names.
+type ClientMetrics map[string]ClientMetric
+
+// ClientMetric is a view of a node client metric.
+type ClientMetric struct {
+	Name  string // as published to the clientmetrics package
+	Type  string // either "gauge" or "counter"
+	Value int64  // the gauge or counter value
 }
 
 // SetAcceptRoutes toggles the node's RouteAll preference (the
@@ -1031,6 +1305,68 @@ func (e *Env) RotateDiscoKey(n *Node) {
 	}
 }
 
+// ForcePreferredDERP pins n's home DERP to the given region via the
+// "force-prefer-derp" debug action, so its reported NetInfo.PreferredDERP is
+// deterministic. The force lives on the long-lived magicsock.Conn and so
+// persists across an in-process profile switch. It fatals the test on error.
+func (e *Env) ForcePreferredDERP(n *Node, region int) {
+	e.t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	b, err := json.Marshal(region)
+	if err != nil {
+		e.t.Fatalf("ForcePreferredDERP(%s): %v", n.name, err)
+	}
+	if err := n.agent.DebugActionBody(ctx, "force-prefer-derp", bytes.NewReader(b)); err != nil {
+		e.t.Fatalf("ForcePreferredDERP(%s, %d): %v", n.name, region, err)
+	}
+}
+
+// Relogin switches n to a fresh login profile on the same test control server,
+// in-process (no daemon restart), so it comes up under a NEW node identity while
+// keeping the same long-lived magicsock.Conn. This is the control-client swap
+// that an interactive login or profile switch performs, and is what the
+// home-DERP re-report fix guards (see [magicsock.Conn.ResetNetInfoLast]).
+//
+// It switches to an empty profile (the in-process control-client swap the
+// LocalAPI PUT /profiles/ performs) and then logs back in with "tailscale up",
+// which both points the new control client at the test control and drives
+// registration to completion. It waits for the node to return to Running and
+// fatals the test on error.
+func (e *Env) Relogin(n *Node) {
+	e.t.Helper()
+	// Generous timeout: the profile switch triggers a fresh registration +
+	// netcheck + DERP connect, which is slow under TCG (no KVM).
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+
+	// Switch to a fresh, empty login profile. This runs the in-process control-
+	// client swap (resetForProfileChangeLocked -> setControlClientLocked) that
+	// clears the home-DERP dedup cache under test, while preserving the existing
+	// magicsock.Conn (and any forced home DERP from [Env.ForcePreferredDERP]).
+	if err := n.agent.SwitchToEmptyProfile(ctx); err != nil {
+		e.t.Fatalf("Relogin(%s): SwitchToEmptyProfile: %v", n.name, err)
+	}
+	// Log back in to the same test control. "tailscale up --login-server" points
+	// the new control client at the test control and drives registration to
+	// completion (testcontrol auto-authorizes), the same path Env.Start uses.
+	if err := e.tailscaleUp(ctx, n); err != nil {
+		e.t.Fatalf("Relogin(%s): up: %v", n.name, err)
+	}
+	if err := tstest.WaitFor(60*time.Second, func() error {
+		st, err := n.agent.Status(ctx)
+		if err != nil {
+			return err
+		}
+		if st.BackendState != "Running" {
+			return fmt.Errorf("backend state = %q, want Running", st.BackendState)
+		}
+		return nil
+	}); err != nil {
+		e.t.Fatalf("Relogin(%s): %v", n.name, err)
+	}
+}
+
 // RestartTailscaled signals tailscaled on n to die so that its supervisor
 // (gokrazy) restarts it. It then waits for tailscaled to come back to the
 // "Running" backend state. It fatals the test on error.
@@ -1105,20 +1441,42 @@ func (e *Env) AddRoute(n *Node, prefix, via string) {
 // SSHExec runs a command on a cloud VM via its debug SSH NIC.
 // Only works for cloud VMs that have the debug NIC and SSH key configured.
 // Returns stdout and any error.
+//
+// SSH transport-level errors (exit code 255: connection refused, auth
+// failure, etc.) are retried for up to ~30s to absorb the race window
+// between Env.Start() returning (when tta reports the tailscale backend
+// as Running) and cloud-init finishing the user/SSH-key setup. The remote
+// command's own non-zero exit codes are returned to the caller without
+// retry.
 func (e *Env) SSHExec(n *Node, cmd string) (string, error) {
 	if n.sshPort == 0 {
 		return "", fmt.Errorf("node %s has no SSH debug port", n.name)
 	}
-	sshCmd := exec.Command("ssh",
-		"-o", "StrictHostKeyChecking=no",
-		"-o", "UserKnownHostsFile=/dev/null",
-		"-o", "ConnectTimeout=5",
-		"-i", "/tmp/vmtest_key",
-		"-p", fmt.Sprintf("%d", n.sshPort),
-		"root@127.0.0.1",
-		cmd)
-	out, err := sshCmd.CombinedOutput()
-	return string(out), err
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		sshCmd := exec.Command("ssh",
+			"-o", "StrictHostKeyChecking=no",
+			"-o", "UserKnownHostsFile=/dev/null",
+			"-o", "BatchMode=yes",
+			"-o", "ConnectTimeout=5",
+			"-o", "LogLevel=ERROR",
+			"-i", "/tmp/vmtest_key",
+			"-p", fmt.Sprintf("%d", n.sshPort),
+			"root@127.0.0.1",
+			cmd)
+		out, err := sshCmd.CombinedOutput()
+		if err == nil {
+			return string(out), nil
+		}
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 255 {
+			return string(out), err
+		}
+		if time.Now().After(deadline) {
+			return string(out), err
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
 }
 
 // DumpStatus logs the tailscale status of a node, including its peers and their
@@ -1215,6 +1573,124 @@ func (e *Env) HTTPGet(from *Node, targetURL string) string {
 	return ""
 }
 
+// HTTPResponse is the result of a successful [Env.HTTPGetStatus] call.
+type HTTPResponse struct {
+	// Status is the upstream HTTP status code.
+	Status int
+	// Body is the upstream response body.
+	Body string
+	// SetCookies is the parsed list of cookies the upstream set, if any.
+	SetCookies []*http.Cookie
+}
+
+// HTTPGetStatus is like [Env.HTTPGet] but returns the upstream HTTP status
+// code, body, and any Set-Cookie response cookies, so callers can assert on
+// rejection responses (e.g. 401, 403) and drive multi-request flows that need
+// cookie continuity (e.g. session-based authentication).
+//
+// Any sendCookies are sent on the upstream request via the Cookie header.
+//
+// The request is proxied through TTA's /http-get handler, which dials via
+// Tailscale's UserDial; this works on any OS the test agent runs on.
+//
+// Like [Env.HTTPGet], HTTPGetStatus retries up to 3 times on TTA-level
+// connection failures (502 / 503 from TTA when it cannot reach upstream).
+// Upstream responses (including 4xx) are returned to the caller without retry.
+func (e *Env) HTTPGetStatus(from *Node, targetURL string, sendCookies ...*http.Cookie) (*HTTPResponse, error) {
+	cookieHeader := ""
+	if len(sendCookies) > 0 {
+		parts := make([]string, 0, len(sendCookies))
+		for _, c := range sendCookies {
+			parts = append(parts, c.Name+"="+c.Value)
+		}
+		cookieHeader = strings.Join(parts, "; ")
+	}
+
+	var lastErr error
+	for attempt := range 3 {
+		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+		reqURL := "http://unused/http-get?url=" + url.QueryEscape(targetURL)
+		req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
+		if err != nil {
+			cancel()
+			return nil, err
+		}
+		if cookieHeader != "" {
+			req.Header.Set("Cookie", cookieHeader)
+		}
+		res, err := from.agent.HTTPClient.Do(req)
+		cancel()
+		if err != nil {
+			e.logVerbosef("HTTPGetStatus attempt %d from %s: %v", attempt+1, from.name, err)
+			lastErr = err
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		b, _ := io.ReadAll(res.Body)
+		res.Body.Close()
+		// A bare 502/503 with no X-Upstream-Status means TTA itself couldn't
+		// reach upstream; retry. If the header is set, the upstream really
+		// did answer with that status and we should pass it through.
+		if (res.StatusCode == http.StatusBadGateway || res.StatusCode == http.StatusServiceUnavailable) &&
+			res.Header.Get("X-Upstream-Status") == "" {
+			e.logVerbosef("HTTPGetStatus attempt %d from %s: TTA %d: %s", attempt+1, from.name, res.StatusCode, string(b))
+			lastErr = fmt.Errorf("TTA %d: %s", res.StatusCode, strings.TrimSpace(string(b)))
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		return &HTTPResponse{
+			Status:     res.StatusCode,
+			Body:       string(b),
+			SetCookies: res.Cookies(),
+		}, nil
+	}
+	return nil, fmt.Errorf("HTTPGetStatus from %s to %s: gave up: %w", from.name, targetURL, lastErr)
+}
+
+// Tailscale runs the tailscale CLI on the given node via TTA.
+func (e *Env) Tailscale(n *Node, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	q := url.Values{}
+	for _, arg := range args {
+		q.Add("arg", arg)
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET", "http://unused/tailscale?"+q.Encode(), nil)
+	if err != nil {
+		return "", err
+	}
+	res, err := n.agent.HTTPClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer res.Body.Close()
+	body, _ := io.ReadAll(res.Body)
+	if res.StatusCode != http.StatusOK {
+		return string(body), fmt.Errorf("tailscale %q: %s: %s", args, res.Status, res.Header.Get("Exec-Err"))
+	}
+	return string(body), nil
+}
+
+// GokrazyRoot returns the kernel root= argument from a Gokrazy node.
+func (e *Env) GokrazyRoot(n *Node) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET", "http://unused/gokrazy-root", nil)
+	if err != nil {
+		return "", err
+	}
+	res, err := n.agent.HTTPClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer res.Body.Close()
+	body, _ := io.ReadAll(res.Body)
+	if res.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("gokrazy-root: %s: %s", res.Status, strings.TrimSpace(string(body)))
+	}
+	return strings.TrimSpace(string(body)), nil
+}
+
 // setNodeScreenshot stores the latest screenshot data URI for a node.
 func (e *Env) setNodeScreenshot(name, dataURI string) {
 	e.nodeStatusMu.Lock()
@@ -1279,14 +1755,78 @@ func (e *Env) initVnet() {
 		if e.allOnline {
 			e.server.ControlServer().AllOnline = true
 		}
+		if e.peerRelayGrants {
+			e.server.ControlServer().PeerRelayGrants = true
+		}
+		if e.selfSignedDERPCertPinning {
+			e.server.ControlServer().DERPMap = e.buildSelfSignedDERPMap()
+		}
+		if e.controlDNS != nil {
+			cs := e.server.ControlServer()
+			cs.MagicDNSDomain = e.controlDNSDomain
+			cs.DNSConfig = e.controlDNS.Clone()
+		}
+		if e.fakeACME {
+			cs := e.server.ControlServer()
+			cs.MagicDNSDomain = "tailnet.test"
+			if cs.DNSConfig == nil {
+				cs.DNSConfig = new(tailcfg.DNSConfig)
+			}
+			cs.DNSConfig.Proxied = true
+		}
+		for _, n := range e.nodes {
+			if n.runSSH {
+				e.server.ControlServer().SSHPolicy = &tailcfg.SSHPolicy{
+					Rules: []*tailcfg.SSHRule{{
+						Principals: []*tailcfg.SSHPrincipal{{Any: true}},
+						// Allow permissive login + root login by default
+						SSHUsers: map[string]string{"*": "=", "root": "root"},
+						Action:   &tailcfg.SSHAction{Accept: true},
+					}},
+				}
+				break
+			}
+		}
 	})
+}
+
+// buildSelfSignedDERPMap returns a DERP map identical in structure to the
+// stock test map (same regions, hostnames, virtual IPs) but with each node's
+// CertName set to "sha256-raw:<hex>" pinning the actual self-signed cert
+// served by vnet's fake DERP server, and InsecureForTests cleared so the
+// pin is actually exercised. Nodes are matched to certs by HostName.
+func (e *Env) buildSelfSignedDERPMap() *tailcfg.DERPMap {
+	hostToHash := make(map[string]string, 2)
+	for i := range 2 {
+		hostToHash[e.server.DERPHostname(i)] = e.server.DERPCertSHA256Hex(i)
+	}
+	src := e.server.ControlServer().DERPMap
+	dm := &tailcfg.DERPMap{
+		Regions: make(map[int]*tailcfg.DERPRegion, len(src.Regions)),
+	}
+	for id, srcRegion := range src.Regions {
+		r := *srcRegion
+		r.Nodes = make([]*tailcfg.DERPNode, len(srcRegion.Nodes))
+		for i, srcNode := range srcRegion.Nodes {
+			n := *srcNode
+			hash, ok := hostToHash[n.HostName]
+			if !ok {
+				e.t.Fatalf("buildSelfSignedDERPMap: no cert hash for HostName %q", n.HostName)
+			}
+			n.InsecureForTests = false
+			n.CertName = "sha256-raw:" + hash
+			r.Nodes[i] = &n
+		}
+		dm.Regions[id] = &r
+	}
+	return dm
 }
 
 // ensureQEMUSocket creates the Unix stream socket for QEMU VMs. Called once.
 func (e *Env) ensureQEMUSocket() {
 	e.qemuSockOnce.Do(func() {
 		e.initVnet()
-		e.sockAddr = filepath.Join(e.tempDir, "vnet.sock")
+		e.sockAddr = filepath.Join(e.sockDir, "vnet.sock")
 		srv, err := net.Listen("unix", e.sockAddr)
 		if err != nil {
 			e.t.Fatalf("listen unix: %v", err)
@@ -1308,8 +1848,7 @@ func (e *Env) ensureQEMUSocket() {
 func (e *Env) ensureDgramSocket() {
 	e.dgramSockOnce.Do(func() {
 		e.initVnet()
-		e.dgramSockAddr = fmt.Sprintf("/tmp/vmtest-dgram-%d.sock", os.Getpid())
-		e.t.Cleanup(func() { os.Remove(e.dgramSockAddr) })
+		e.dgramSockAddr = filepath.Join(e.sockDir, "dgram.sock")
 		dgramAddr, err := net.ResolveUnixAddr("unixgram", e.dgramSockAddr)
 		if err != nil {
 			e.t.Fatalf("resolve dgram addr: %v", err)
@@ -1657,15 +2196,85 @@ func findKernelPath(goMod string) (string, error) {
 	}
 	goModCache := strings.TrimSpace(string(goModCacheB))
 
-	// Parse go.mod to find gokrazy-kernel version.
-	for _, line := range strings.Split(string(b), "\n") {
+	// Parse go.mod to find kernel version.
+	for line := range strings.SplitSeq(string(b), "\n") {
 		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "github.com/tailscale/gokrazy-kernel") {
+		if strings.HasPrefix(line, "github.com/gokrazy/kernel.amd64") {
 			parts := strings.Fields(line)
 			if len(parts) >= 2 {
 				return filepath.Join(goModCache, parts[0]+"@"+parts[1], "vmlinuz"), nil
 			}
 		}
 	}
-	return "", fmt.Errorf("gokrazy-kernel not found in %s", goMod)
+	return "", fmt.Errorf("kernel.amd64 not found in %s", goMod)
+}
+
+// PingRoute describes what connection type was used to transfer a Disco ping.
+type PingRoute string
+
+const (
+	PingRouteDirect PingRoute = "direct"
+	PingRouteDERP   PingRoute = "derp"
+	PingRouteLocal  PingRoute = "local"
+	PingRouteNil    PingRoute = "nil"
+)
+
+// classifyPing finds what kind of route has been used on a ping path.
+// It is only really relevant for DiscoPings.
+func classifyPing(pr *ipnstate.PingResult) PingRoute {
+	if pr == nil {
+		return PingRouteNil
+	}
+
+	if pr.Endpoint == "" {
+		return PingRouteDERP
+	}
+
+	ap, err := netip.ParseAddrPort(pr.Endpoint)
+	if err == nil && ap.Addr().IsPrivate() {
+		return PingRouteLocal
+	}
+	return PingRouteDirect
+}
+
+// PingExpect retries disco pings until the result matches wantRoute or the
+// timeout is reached. It is using DiscoPings as this is the only ping type
+// that can classify the connection type.
+func (e *Env) PingExpect(from, to *Node, wantRoute PingRoute, timeout time.Duration) error {
+	e.t.Helper()
+	ctx, cancel := context.WithTimeout(e.t.Context(), timeout)
+	defer cancel()
+	var lastRoute PingRoute
+	toSt, err := to.agent.Status(ctx)
+	if err != nil {
+		return fmt.Errorf("ping: can't get %s status: %w", to.name, err)
+	}
+	if len(toSt.Self.TailscaleIPs) == 0 {
+		return fmt.Errorf("ping: %s has no Tailscale IPs", to.name)
+	}
+	targetIP := toSt.Self.TailscaleIPs[0]
+	for ctx.Err() == nil {
+		pingCtx, pingCancel := context.WithTimeout(ctx, 3*time.Second)
+		pr, err := from.agent.PingWithOpts(pingCtx, targetIP, tailcfg.PingDisco, local.PingOpts{})
+		pingCancel()
+		if err == nil && pr.Err == "" {
+			if got := classifyPing(pr); got == wantRoute {
+				e.t.Logf("Saw ping type %q", got)
+				return nil
+			} else {
+				e.t.Logf("Saw ping type %q", got)
+				lastRoute = got
+			}
+		}
+		select {
+		case <-time.After(500 * time.Millisecond):
+		case <-ctx.Done():
+		}
+	}
+	return fmt.Errorf("ping route = %q, want %q (after %v)", lastRoute, wantRoute, timeout)
+}
+
+// NumNodes returns the current number of nodes configured in the env.
+func (env *Env) NumNodes() int {
+	return len(env.nodes)
 }

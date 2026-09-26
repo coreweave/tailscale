@@ -160,6 +160,7 @@ var Features = map[FeatureTag]FeatureMeta{
 	"desktop_sessions": {Sym: "DesktopSessions", Desc: "Desktop sessions support"},
 	"doctor":           {Sym: "Doctor", Desc: "Diagnose possible issues with Tailscale and its host environment"},
 	"drive":            {Sym: "Drive", Desc: "Tailscale Drive (file server) support"},
+	"flashappliance":   {Sym: "FlashAppliance", Desc: "'tailscale configure flash-appliance' and 'pve-appliance' CLI commands for deploying Tailscale appliance images"},
 	"gro": {
 		Sym:  "GRO",
 		Desc: "Generic Receive Offload support (performance)",
@@ -228,12 +229,26 @@ var Features = map[FeatureTag]FeatureMeta{
 		Desc: "Linux NetworkManager integration",
 		Deps: []FeatureTag{"dbus"},
 	},
-	"qrcodes":     {Sym: "QRCodes", Desc: "QR codes in tailscale CLI"},
-	"relayserver": {Sym: "RelayServer", Desc: "Relay server"},
+	"serviceclientprefs": {Sym: "ServiceClientPrefs", Desc: "Desktop client service launch preferences"},
+	"qrcodes":            {Sym: "QRCodes", Desc: "QR codes in tailscale CLI"},
+	"relayserver":        {Sym: "RelayServer", Desc: "Relay server"},
+	"remoteconfig": {
+		Sym:  "RemoteConfig",
+		Desc: "Full remote configuration of this node by the tailnet admin, opting out of Tailscale's per-feature double opt-in in favor of a single client-side trust decision",
+		Deps: []FeatureTag{"c2n"},
+	},
 	"resolved": {
 		Sym:  "Resolved",
 		Desc: "Linux systemd-resolved integration",
 		Deps: []FeatureTag{"dbus"},
+	},
+	"routecheck": {
+		Sym:  "RouteCheck",
+		Desc: "Support checking the reachability of overlapping routers, for choosing between multiple network paths to the same IP address",
+	},
+	"runtimemetrics": {
+		Sym:  "RuntimeMetrics",
+		Desc: "Support emission of runtime/metrics as clientmetrics",
 	},
 	"sdnotify": {
 		Sym:  "SDNotify",
@@ -252,6 +267,10 @@ var Features = map[FeatureTag]FeatureMeta{
 	"synology": {
 		Sym:  "Synology",
 		Desc: "Synology NAS integration (applies to Linux builds only)",
+	},
+	"syslog": {
+		Sym:  "Syslog",
+		Desc: "tailscaled --syslog flag support to send logs to the system syslog daemon",
 	},
 	"syspolicy": {Sym: "SystemPolicy", Desc: "System policy configuration (MDM) support"},
 	"systray": {

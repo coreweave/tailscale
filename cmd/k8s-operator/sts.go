@@ -783,7 +783,7 @@ func (r *tailscaleSTSReconciler) reconcileSTS(ctx context.Context, logger *zap.S
 		// No need to error out if now or in future we end up in a
 		// situation where app info cannot be determined for one of the
 		// many proxy configurations that the operator can produce.
-		logger.Error("[unexpected] unable to determine proxy type")
+		logger.Error("unable to determine proxy type")
 	} else {
 		container.Env = append(container.Env, corev1.EnvVar{
 			Name:  "TS_INTERNAL_APP",
@@ -993,7 +993,7 @@ func enableEndpoints(ss *appsv1.StatefulSet, metrics, debug bool) {
 		if isMainContainer(&c) {
 			if debug {
 				ss.Spec.Template.Spec.Containers[i].Env = append(ss.Spec.Template.Spec.Containers[i].Env,
-					// Serve tailscaled's debug metrics on on
+					// Serve tailscaled's debug metrics on
 					// <pod-ip>:9001/debug/metrics. If we didn't specify Pod IP
 					// here, the proxy would, in some cases, also listen to its
 					// Tailscale IP- we don't want folks to start relying on this
@@ -1321,7 +1321,7 @@ func proxyCapVer(sec *corev1.Secret, podUID string, log *zap.SugaredLogger) tail
 	}
 	capVer, err := strconv.Atoi(string(sec.Data[kubetypes.KeyCapVer]))
 	if err != nil {
-		log.Infof("[unexpected]: unexpected capability version in proxy's state Secret, expected an integer, got %q", string(sec.Data[kubetypes.KeyCapVer]))
+		log.Warnf("unexpected capability version in proxy's state Secret, expected an integer, got %q", string(sec.Data[kubetypes.KeyCapVer]))
 		return tailcfg.CapabilityVersion(-1)
 	}
 	if !strings.EqualFold(podUID, string(sec.Data[kubetypes.KeyPodUID])) {

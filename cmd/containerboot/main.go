@@ -105,6 +105,9 @@
 //     containerboot instance is not running in Kubernetes, autoadvertise any services
 //     defined in the devices serve config, and unadvertise on shutdown. Defaults
 //     to `true`, but can be disabled to allow user specific advertisement configuration.
+//   - TS_BOOT_TIMEOUT: if set, overrides the default 60s timeout for the
+//     initial map response wait during boot. Accepts any time.Duration
+//     string (e.g. "90s", "3m").
 //
 // When running on Kubernetes, containerboot defaults to storing state in the
 // "tailscale" kube secret. To store state on local disk instead, set
@@ -120,6 +123,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"iter"
 	"log"
 	"math"
 	"net"
@@ -135,11 +139,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/benbjohnson/immutable"
 	"golang.org/x/sys/unix"
 
 	"tailscale.com/client/local"
 	"tailscale.com/health"
 	"tailscale.com/ipn"
+	"tailscale.com/ipn/ipnstate"
 	kubeutils "tailscale.com/k8s-operator"
 	"tailscale.com/kube/authkey"
 	healthz "tailscale.com/kube/health"
@@ -149,21 +155,259 @@ import (
 	"tailscale.com/kube/services"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/logger"
-	"tailscale.com/types/netmap"
+	"tailscale.com/types/views"
+	"tailscale.com/util/backoff"
 	"tailscale.com/util/deephash"
+	"tailscale.com/util/def"
 	"tailscale.com/util/dnsname"
 	"tailscale.com/util/linuxfw"
 )
 
 func newNetfilterRunner(logf logger.Logf) (linuxfw.NetfilterRunner, error) {
-	if defaultBool("TS_TEST_FAKE_NETFILTER", false) {
+	if def.Bool(os.Getenv("TS_TEST_FAKE_NETFILTER"), false) {
 		return linuxfw.NewFakeIPTablesRunner(), nil
 	}
 	return linuxfw.New(logf, "")
 }
 
 func getAutoAdvertiseBool() bool {
-	return defaultBool("TS_EXPERIMENTAL_SERVICE_AUTO_ADVERTISEMENT", true)
+	return def.Bool(os.Getenv("TS_EXPERIMENTAL_SERVICE_AUTO_ADVERTISEMENT"), true)
+}
+
+func containerbootWatchMask(cfg *settings) ipn.NotifyWatchOpt {
+	mask := ipn.NotifyInitialStatus | ipn.NotifyNoNetMap
+	if cfg.TailnetTargetFQDN != "" || cfg.EgressProxiesCfgPath != "" {
+		mask |= ipn.NotifyPeerChanges
+	}
+	return mask
+}
+
+func notifyState(n ipn.Notify) (_ ipn.State, ok bool) {
+	if n.State != nil {
+		return *n.State, true
+	}
+	if n.InitialStatus != nil && n.InitialStatus.BackendState != "" {
+		if state, ok := ipn.StateFromString(n.InitialStatus.BackendState); ok {
+			return state, true
+		}
+	}
+	return ipn.NoState, false
+}
+
+var netmapStatePeerIDHasher = immutable.NewHasher(tailcfg.NodeID(0))
+
+type netmapState struct {
+	self            tailcfg.NodeView
+	peersByID       *immutable.Map[tailcfg.NodeID, tailcfg.NodeView]
+	peersByName     *immutable.Map[string, tailcfg.NodeView] // keyed by tailcfg.Node.Name when NodeID is unavailable
+	certDomains     views.Slice[string]
+	dnsExtraRecords views.Slice[tailcfg.DNSRecord]
+}
+
+func (s netmapState) updateFromNotify(n ipn.Notify) netmapState {
+	if n.InitialStatus != nil {
+		s = s.updateFromStatus(n.InitialStatus)
+	}
+	if n.SelfChange != nil {
+		s.self = n.SelfChange.View()
+	}
+	for _, p := range n.PeersChanged {
+		s = s.upsertPeer(p.View())
+	}
+	for _, id := range n.PeersRemoved {
+		if s.peersByID != nil {
+			s.peersByID = s.peersByID.Delete(id)
+		}
+	}
+	return s
+}
+
+// processNotify updates the netmap state from an IPN bus Notify. On
+// SelfChange it also refetches DNS via the LocalAPI dns-config
+// endpoint; the bus carries no DNS delta.
+func (s netmapState) processNotify(ctx context.Context, client *local.Client, n ipn.Notify) netmapState {
+	s = s.updateFromNotify(n)
+	if n.SelfChange != nil {
+		dns, err := client.DNSConfig(ctx)
+		if err != nil {
+			log.Printf("error refreshing DNS config from tailscaled: %v", err)
+		} else if dns != nil {
+			s.dnsExtraRecords = views.SliceOf(dns.ExtraRecords)
+			s.certDomains = views.SliceOf(dns.CertDomains)
+		}
+	}
+	return s
+}
+
+func (s netmapState) updateFromStatus(st *ipnstate.Status) netmapState {
+	s = netmapState{
+		certDomains:     views.SliceOf(st.CertDomains),
+		dnsExtraRecords: views.SliceOf(st.ExtraRecords),
+	}
+	if st.Self != nil {
+		s.self = nodeFromPeerStatus(st.Self).View()
+	}
+	for _, ps := range st.Peer {
+		s = s.upsertPeer(nodeFromPeerStatus(ps).View())
+	}
+	return s
+}
+
+type watchIPNBusFunc func(context.Context, ipn.NotifyWatchOpt) (klc.IPNBusWatcher, error)
+
+// maxIPNBusDialFailure is how long reconnectingIPNBusWatcher keeps failing to
+// open a new watch before giving up. A closed stream is always retried, but a
+// watch that cannot be opened at all usually means tailscaled is gone.
+const maxIPNBusDialFailure = time.Minute
+
+type reconnectingIPNBusWatcher struct {
+	ctx            context.Context
+	watch          watchIPNBusFunc
+	mask           ipn.NotifyWatchOpt
+	bo             *backoff.Backoff
+	watcher        klc.IPNBusWatcher
+	startedAt      time.Time
+	maxDialFailure time.Duration
+	dialFailSince  time.Time
+}
+
+func newReconnectingIPNBusWatcher(ctx context.Context, name string, watch watchIPNBusFunc, mask ipn.NotifyWatchOpt, maxBackoff time.Duration) *reconnectingIPNBusWatcher {
+	return &reconnectingIPNBusWatcher{
+		ctx:            ctx,
+		watch:          watch,
+		mask:           mask,
+		bo:             backoff.NewBackoff(name, log.Printf, maxBackoff),
+		maxDialFailure: maxIPNBusDialFailure,
+	}
+}
+
+// Next returns the next notification, reconnecting after the watch stream
+// closes. Each new watch starts with an authoritative InitialStatus snapshot.
+func (w *reconnectingIPNBusWatcher) Next() (ipn.Notify, error) {
+	for {
+		if err := w.ctx.Err(); err != nil {
+			return ipn.Notify{}, err
+		}
+		if w.watcher == nil {
+			watcher, err := w.watch(w.ctx, w.mask)
+			if err != nil {
+				if w.dialFailSince.IsZero() {
+					w.dialFailSince = time.Now()
+				} else if time.Since(w.dialFailSince) >= w.maxDialFailure {
+					return ipn.Notify{}, err
+				}
+				w.bo.BackOff(w.ctx, err)
+				continue
+			}
+			w.watcher = watcher
+			w.startedAt = time.Now()
+			w.dialFailSince = time.Time{}
+		}
+
+		n, err := w.watcher.Next()
+		if err == nil {
+			if n.ErrMessage != nil {
+				log.Printf("tailscaled IPN bus error: %s", *n.ErrMessage)
+			}
+			return n, nil
+		}
+		w.watcher.Close()
+		w.watcher = nil
+		if ctxErr := w.ctx.Err(); ctxErr != nil {
+			return ipn.Notify{}, ctxErr
+		}
+		log.Printf("IPN bus watch ended; reconnecting: %v", err)
+		if time.Since(w.startedAt) >= 30*time.Second {
+			w.bo.Reset()
+		}
+		w.bo.BackOff(w.ctx, err)
+	}
+}
+
+func (w *reconnectingIPNBusWatcher) SetMask(mask ipn.NotifyWatchOpt) {
+	w.Close()
+	w.mask = mask
+	w.bo.Reset()
+}
+
+func (w *reconnectingIPNBusWatcher) Close() error {
+	if w.watcher == nil {
+		return nil
+	}
+	err := w.watcher.Close()
+	w.watcher = nil
+	return err
+}
+
+func (s netmapState) upsertPeer(n tailcfg.NodeView) netmapState {
+	if !n.Valid() {
+		return s
+	}
+	if s.peersByID == nil {
+		s.peersByID = immutable.NewMap[tailcfg.NodeID, tailcfg.NodeView](netmapStatePeerIDHasher)
+	}
+	if s.peersByName == nil {
+		s.peersByName = immutable.NewMap[string, tailcfg.NodeView](nil)
+	}
+	if n.ID() != 0 {
+		s.peersByID = s.peersByID.Set(n.ID(), n)
+		if name := n.Name(); name != "" {
+			s.peersByName = s.peersByName.Delete(name)
+		}
+		return s
+	}
+	if n.Name() != "" {
+		s.peersByName = s.peersByName.Set(n.Name(), n)
+	}
+	return s
+}
+
+func nodeFromPeerStatus(ps *ipnstate.PeerStatus) *tailcfg.Node {
+	if ps == nil {
+		return nil
+	}
+	n := &tailcfg.Node{
+		ID:       ps.NodeID,
+		StableID: ps.ID,
+		Name:     ps.DNSName,
+		Key:      ps.PublicKey,
+	}
+	for _, ip := range ps.TailscaleIPs {
+		n.Addresses = append(n.Addresses, netip.PrefixFrom(ip, ip.BitLen()))
+	}
+	if ps.AllowedIPs != nil {
+		n.AllowedIPs = ps.AllowedIPs.AsSlice()
+	}
+	return n
+}
+
+func (s netmapState) peers() iter.Seq[tailcfg.NodeView] {
+	return func(yield func(tailcfg.NodeView) bool) {
+		if s.peersByID != nil {
+			it := s.peersByID.Iterator()
+			for {
+				_, p, ok := it.Next()
+				if !ok {
+					break
+				}
+				if !yield(p) {
+					return
+				}
+			}
+		}
+		if s.peersByName != nil {
+			it := s.peersByName.Iterator()
+			for {
+				_, p, ok := it.Next()
+				if !ok {
+					break
+				}
+				if !yield(p) {
+					return
+				}
+			}
+		}
+	}
 }
 
 func main() {
@@ -205,7 +449,7 @@ func run() error {
 	// bootCtx is used for all setup stuff until we're in steady
 	// state, so that if something is hanging we eventually time out
 	// and crashloop the container.
-	bootCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	bootCtx, cancel := context.WithTimeout(ctx, cfg.BootCtxTimeout)
 	defer cancel()
 
 	var tailscaledConfigAuthkey string
@@ -272,7 +516,7 @@ func run() error {
 		mux := http.NewServeMux()
 
 		log.Printf("Running healthcheck endpoint at %s/healthz", cfg.HealthCheckAddrPort)
-		healthCheck = healthz.RegisterHealthHandlers(mux, cfg.PodIPv4, log.Printf)
+		healthCheck = healthz.RegisterHealthHandlers(mux, cfg.PodIPv4, cfg.PodIPv6, log.Printf)
 
 		close := runHTTPServer(mux, cfg.HealthCheckAddrPort)
 		defer close()
@@ -288,7 +532,7 @@ func run() error {
 
 		if cfg.localHealthEnabled() {
 			log.Printf("Running healthcheck endpoint at %s/healthz", cfg.LocalAddrPort)
-			healthCheck = healthz.RegisterHealthHandlers(mux, cfg.PodIPv4, log.Printf)
+			healthCheck = healthz.RegisterHealthHandlers(mux, cfg.PodIPv4, cfg.PodIPv6, log.Printf)
 		}
 
 		if cfg.egressSvcsTerminateEPEnabled() {
@@ -306,10 +550,10 @@ func run() error {
 		}
 	}
 
-	w, err := client.WatchIPNBus(bootCtx, ipn.NotifyInitialNetMap|ipn.NotifyInitialPrefs|ipn.NotifyInitialState|ipn.NotifyInitialHealthState|ipn.NotifyRateLimit)
-	if err != nil {
-		return fmt.Errorf("failed to watch tailscaled for updates: %w", err)
-	}
+	watchMask := containerbootWatchMask(cfg)
+	authWatchMask := watchMask | ipn.NotifyInitialPrefs | ipn.NotifyInitialHealthState
+	localClient := klc.New(client)
+	w := newReconnectingIPNBusWatcher(bootCtx, "containerboot-auth-ipn-watch", localClient.WatchIPNBus, authWatchMask, 5*time.Second)
 
 	// Now that we've started tailscaled, we can symlink the socket to the
 	// default location if needed.
@@ -346,10 +590,8 @@ func run() error {
 		if err := tailscaleUp(bootCtx, cfg); err != nil {
 			return fmt.Errorf("failed to auth tailscale: %w", err)
 		}
-		w, err = client.WatchIPNBus(bootCtx, ipn.NotifyInitialNetMap|ipn.NotifyInitialState|ipn.NotifyRateLimit)
-		if err != nil {
-			return fmt.Errorf("rewatching tailscaled for updates after auth: %w", err)
-		}
+		authWatchMask = watchMask
+		w.SetMask(authWatchMask)
 		return nil
 	}
 
@@ -363,11 +605,11 @@ authLoop:
 	for {
 		n, err := w.Next()
 		if err != nil {
-			return fmt.Errorf("failed to read from tailscaled: %w", err)
+			return fmt.Errorf("reading tailscaled IPN bus: %w", err)
 		}
 
-		if n.State != nil {
-			switch *n.State {
+		if state, ok := notifyState(n); ok {
+			switch state {
 			case ipn.NeedsLogin:
 				if isOneStepConfig(cfg) {
 					// This could happen if this is the first time tailscaled was run for this
@@ -403,7 +645,7 @@ authLoop:
 				// deadline to continue monitoring for changes.
 				break authLoop
 			default:
-				log.Printf("tailscaled in state %q, waiting", *n.State)
+				log.Printf("tailscaled in state %q, waiting", state)
 			}
 		}
 
@@ -456,11 +698,6 @@ authLoop:
 		if err := kc.deleteAuthKey(ctx); err != nil {
 			return fmt.Errorf("deleting authkey from Kubernetes Secret: %w", err)
 		}
-	}
-
-	w, err = client.WatchIPNBus(ctx, ipn.NotifyInitialNetMap|ipn.NotifyInitialState|ipn.NotifyRateLimit)
-	if err != nil {
-		return fmt.Errorf("rewatching tailscaled for updates after auth: %w", err)
 	}
 
 	// If tailscaled config was read from a mounted file, watch the file for updates and reload.
@@ -537,26 +774,27 @@ authLoop:
 		failedResolveAttempts++
 	}
 
-	var egressSvcsNotify chan *netmap.NetworkMap
+	var egressSvcsNotify chan netmapState
 	notifyChan := make(chan ipn.Notify)
-	errChan := make(chan error)
+	errChan := make(chan error, 1)
+	steadyWatch := newReconnectingIPNBusWatcher(ctx, "containerboot-ipn-watch", localClient.WatchIPNBus, watchMask, 30*time.Second)
 	go func() {
 		for {
-			n, err := w.Next()
+			n, err := steadyWatch.Next()
 			if err != nil {
-				errChan <- err
-				break
-			} else {
-				notifyChan <- n
+				if ctx.Err() == nil {
+					errChan <- err
+				}
+				return
+			}
+			select {
+			case notifyChan <- n:
+			case <-ctx.Done():
+				return
 			}
 		}
 	}()
-	// Peer set changes (Add/Remove) no longer ride on the IPN bus; poll
-	// periodically so egress FQDN resolution and peer-aware work picks
-	// them up. SelfChange covers prompt self changes.
-	const peerPollInterval = 15 * time.Second
-	peerPoll := time.NewTicker(peerPollInterval)
-	defer peerPoll.Stop()
+	var nmState netmapState
 	var wg sync.WaitGroup
 
 runLoop:
@@ -571,22 +809,20 @@ runLoop:
 			killTailscaled()
 			break runLoop
 		case err := <-errChan:
-			return fmt.Errorf("failed to read from tailscaled: %w", err)
+			return fmt.Errorf("reading tailscaled IPN bus: %w", err)
 		case err := <-cfgWatchErrChan:
 			return fmt.Errorf("failed to watch tailscaled config: %w", err)
-		case <-peerPoll.C:
-			processNetmap = true
 		case n := <-notifyChan:
-			// TODO: (ChaosInTheCRD) Add node removed check when supported by ipn
-			if n.State != nil && *n.State != ipn.Running {
+			nmState = nmState.processNotify(ctx, client, n)
+			if state, ok := notifyState(n); ok && state != ipn.Running {
 				// Something's gone wrong and we've left the authenticated state.
 				// Our container image never recovered gracefully from this, and the
 				// control flow required to make it work now is hard. So, just crash
 				// the container and rely on the container runtime to restart us,
 				// whereupon we'll go through initial auth again.
-				return fmt.Errorf("tailscaled left running state (now in state %q), exiting", *n.State)
+				return fmt.Errorf("tailscaled left running state (now in state %q), exiting", state)
 			}
-			if n.SelfChange != nil {
+			if n.InitialStatus != nil || n.SelfChange != nil || len(n.PeersChanged) != 0 || len(n.PeersRemoved) != 0 || len(n.PeerChangedPatch) != 0 {
 				processNetmap = true
 			}
 		case <-tc:
@@ -616,13 +852,12 @@ runLoop:
 		if !processNetmap {
 			continue
 		}
-		nm, err := fetchNetMap(ctx, client)
-		if err != nil {
-			log.Printf("error fetching netmap: %v", err)
+		self := nmState.self
+		if !self.Valid() {
 			continue
 		}
-		if nm != nil {
-			addrs = nm.SelfNode.Addresses().AsSlice()
+		{
+			addrs = self.Addresses().AsSlice()
 			newCurrentIPs := deephash.Hash(&addrs)
 			ipsHaveChanged := newCurrentIPs != currentIPs
 
@@ -634,14 +869,14 @@ runLoop:
 			// Kubernetes Secret to clean up tailnet nodes
 			// for proxies whose route setup continuously
 			// fails.
-			deviceID := nm.SelfNode.StableID()
+			deviceID := self.StableID()
 			if hasKubeStateStore(cfg) && deephash.Update(&currentDeviceID, &deviceID) {
-				if err := kc.storeDeviceID(ctx, nm.SelfNode.StableID()); err != nil {
+				if err := kc.storeDeviceID(ctx, deviceID); err != nil {
 					return fmt.Errorf("storing device ID in Kubernetes Secret: %w", err)
 				}
 			}
 			if cfg.TailnetTargetFQDN != "" {
-				egressAddrs, err := resolveTailnetFQDN(nm, cfg.TailnetTargetFQDN)
+				egressAddrs, err := resolveTailnetFQDN(nmState, cfg.TailnetTargetFQDN)
 				if err != nil {
 					log.Print(err.Error())
 					break
@@ -697,7 +932,10 @@ runLoop:
 				backendAddrs = newBackendAddrs
 			}
 			if cfg.ServeConfigPath != "" {
-				cd := certDomainFromNetmap(nm)
+				var cd string
+				if nmState.certDomains.Len() != 0 {
+					cd = nmState.certDomains.At(0)
+				}
 				if cd == "" {
 					cd = kubetypes.ValueNoHTTPS
 				}
@@ -740,9 +978,9 @@ runLoop:
 			// set up ensures that the operator does not
 			// advertize endpoints of broken proxies.
 			// TODO (irbekrm): instead of using the IP and FQDN, have some other mechanism for the proxy signal that it is 'Ready'.
-			deviceEndpoints := []any{nm.SelfNode.Name(), nm.SelfNode.Addresses()}
+			deviceEndpoints := []any{self.Name(), self.Addresses()}
 			if hasKubeStateStore(cfg) && deephash.Update(&currentDeviceEndpoints, &deviceEndpoints) {
-				if err := kc.storeDeviceEndpoints(ctx, nm.SelfNode.Name(), nm.SelfNode.Addresses().AsSlice()); err != nil {
+				if err := kc.storeDeviceEndpoints(ctx, self.Name(), addrs); err != nil {
 					return fmt.Errorf("storing device IPs and FQDN in Kubernetes Secret: %w", err)
 				}
 			}
@@ -758,7 +996,7 @@ runLoop:
 					return fmt.Errorf("autoadvertisement: failed to get serve config: %w", err)
 				}
 
-				err = refreshAdvertiseServices(ctx, prevServeConfig, klc.New(client))
+				err = refreshAdvertiseServices(ctx, prevServeConfig, localClient)
 				if err != nil {
 					return fmt.Errorf("autoadvertisement: failed to refresh advertise services: %w", err)
 				}
@@ -771,7 +1009,7 @@ runLoop:
 			}
 
 			if egressSvcsNotify != nil {
-				egressSvcsNotify <- nm
+				egressSvcsNotify <- nmState
 			}
 		}
 		if !startupTasksDone {
@@ -793,7 +1031,7 @@ runLoop:
 				// will crash this node.
 				if cfg.EgressProxiesCfgPath != "" {
 					log.Printf("configuring egress proxy using configuration file at %s", cfg.EgressProxiesCfgPath)
-					egressSvcsNotify = make(chan *netmap.NetworkMap)
+					egressSvcsNotify = make(chan netmapState)
 					opts := egressProxyRunOpts{
 						cfgPath:      cfg.EgressProxiesCfgPath,
 						nfr:          nfr,
@@ -802,10 +1040,11 @@ runLoop:
 						stateSecret:  cfg.KubeSecret,
 						netmapChan:   egressSvcsNotify,
 						podIPv4:      cfg.PodIPv4,
+						podIPv6:      cfg.PodIPv6,
 						tailnetAddrs: addrs,
 					}
 					go func() {
-						if err := ep.run(ctx, nm, opts); err != nil {
+						if err := ep.run(ctx, nmState, opts); err != nil {
 							egressSvcsErrorChan <- err
 						}
 					}()
@@ -985,44 +1224,53 @@ func runHTTPServer(mux *http.ServeMux, addr string) (close func() error) {
 	}
 }
 
-// fetchNetMap fetches the current netmap from tailscaled via the
-// "current-netmap" localapi debug action. The debug action's payload
-// shape is intentionally not part of any stable API; containerboot
-// reads its own internal-package types out of it. New external consumers
-// should not rely on this — see [local.Client.Status] and friends.
-func fetchNetMap(ctx context.Context, lc *local.Client) (*netmap.NetworkMap, error) {
-	return local.GetDebugResultJSON[*netmap.NetworkMap](ctx, lc, "current-netmap")
-}
-
 // resolveTailnetFQDN resolves a tailnet FQDN to a list of IP prefixes, which
-// can be either a peer device or a Tailscale Service.
-func resolveTailnetFQDN(nm *netmap.NetworkMap, fqdn string) ([]netip.Prefix, error) {
+// can be either a peer device, a Tailscale Service, or a 4via6 synthesized
+// DNS name (e.g. "10-1-0-5-via-7.tailnet.ts.net").
+func resolveTailnetFQDN(nm netmapState, fqdn string) ([]netip.Prefix, error) {
 	dnsFQDN, err := dnsname.ToFQDN(fqdn)
 	if err != nil {
 		return nil, fmt.Errorf("error parsing %q as FQDN: %w", fqdn, err)
 	}
 
 	// Check all peer devices first.
-	for _, p := range nm.Peers {
+	var ret []netip.Prefix
+	for p := range nm.peers() {
 		if strings.EqualFold(p.Name(), dnsFQDN.WithTrailingDot()) {
-			return p.Addresses().AsSlice(), nil
+			ret = p.Addresses().AsSlice()
+			break
 		}
+	}
+	if ret != nil {
+		return ret, nil
 	}
 
 	// If not found yet, check for a matching Tailscale Service.
 	if svcIPs := serviceIPsFromNetMap(nm, dnsFQDN); len(svcIPs) != 0 {
 		return svcIPs, nil
 	}
+	// If not found yet, check for a matching 4via6 DNS name.
+	if addr, ok := kubeutils.ResolveViaDomain(dnsFQDN.WithTrailingDot()); ok {
+		prefix := netip.PrefixFrom(addr, addr.BitLen())
+		for nn := range nm.peers() {
+			for _, allowedIP := range nn.AllowedIPs().All() {
+				if allowedIP.Contains(addr) {
+					return []netip.Prefix{prefix}, nil
+				}
+			}
+		}
+		return nil, fmt.Errorf("resolved 4via6 address %v for %q but no peer advertises a route containing it", addr, fqdn)
+	}
 
-	return nil, fmt.Errorf("could not find Tailscale node or service %q; it either does not exist, or not reachable because of ACLs", fqdn)
+	return nil, fmt.Errorf("could not find Tailscale node, service or 4via6 address %q; it either does not exist, or not reachable because of ACLs", fqdn)
 }
 
 // serviceIPsFromNetMap returns all IPs of a Tailscale Service if its FQDN is
 // found in the netmap. Note that Tailscale Services are not a first-class
 // object in the netmap, so we guess based on DNS ExtraRecords and AllowedIPs.
-func serviceIPsFromNetMap(nm *netmap.NetworkMap, fqdn dnsname.FQDN) []netip.Prefix {
+func serviceIPsFromNetMap(nm netmapState, fqdn dnsname.FQDN) []netip.Prefix {
 	var extraRecords []tailcfg.DNSRecord
-	for _, rec := range nm.DNS.ExtraRecords {
+	for _, rec := range nm.dnsExtraRecords.All() {
 		recFQDN, err := dnsname.ToFQDN(rec.Name)
 		if err != nil {
 			continue
@@ -1044,7 +1292,7 @@ func serviceIPsFromNetMap(nm *netmap.NetworkMap, fqdn dnsname.FQDN) []netip.Pref
 			continue
 		}
 		ipPrefix := netip.PrefixFrom(ip, ip.BitLen())
-		for _, ps := range nm.Peers {
+		for ps := range nm.peers() {
 			for _, allowedIP := range ps.AllowedIPs().All() {
 				if allowedIP == ipPrefix {
 					prefixes = append(prefixes, ipPrefix)

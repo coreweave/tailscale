@@ -17,7 +17,11 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
+	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
+	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
+	"gvisor.dev/gvisor/pkg/waiter"
 	"tailscale.com/envknob"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnlocal"
@@ -259,6 +263,7 @@ func TestShouldHandlePing(t *testing.T) {
 			impl := makeNetstack(t, func(impl *Impl) {
 				impl.ProcessSubnets = subnets
 			})
+
 			pingDst, ok := impl.shouldHandlePing(pkt)
 
 			// Handled due to being 4via6
@@ -470,7 +475,7 @@ func TestShouldProcessInbound(t *testing.T) {
 				IPServiceMap := netmap.IPServiceMappings{
 					serviceIP: "svc:test-service",
 				}
-				i.lb.SetIPServiceMappingsForTest(IPServiceMap)
+				i.lb.ForTest().SetIPServiceMappings(IPServiceMap)
 
 				i.atomicIsVIPServiceIPFunc.Store(func(addr netip.Addr) bool {
 					return addr == serviceIP
@@ -517,7 +522,7 @@ func TestShouldProcessInbound(t *testing.T) {
 				IPServiceMap := netmap.IPServiceMappings{
 					serviceIP: "svc:test-service",
 				}
-				i.lb.SetIPServiceMappingsForTest(IPServiceMap)
+				i.lb.ForTest().SetIPServiceMappings(IPServiceMap)
 
 				i.atomicIsVIPServiceIPFunc.Store(func(addr netip.Addr) bool {
 					return addr == serviceIP
@@ -543,7 +548,7 @@ func TestShouldProcessInbound(t *testing.T) {
 				IPServiceMap := netmap.IPServiceMappings{
 					serviceIPv6: "svc:test-service",
 				}
-				i.lb.SetIPServiceMappingsForTest(IPServiceMap)
+				i.lb.ForTest().SetIPServiceMappings(IPServiceMap)
 
 				i.atomicIsVIPServiceIPFunc.Store(func(addr netip.Addr) bool {
 					return addr == serviceIPv6
@@ -587,7 +592,7 @@ func TestShouldProcessInbound(t *testing.T) {
 				IPServiceMap := netmap.IPServiceMappings{
 					serviceIPv6: "svc:test-service",
 				}
-				i.lb.SetIPServiceMappingsForTest(IPServiceMap)
+				i.lb.ForTest().SetIPServiceMappings(IPServiceMap)
 
 				i.atomicIsVIPServiceIPFunc.Store(func(addr netip.Addr) bool {
 					return addr == serviceIPv6
@@ -614,7 +619,7 @@ func TestShouldProcessInbound(t *testing.T) {
 				IPServiceMap := netmap.IPServiceMappings{
 					serviceIP: "svc:test-service",
 				}
-				i.lb.SetIPServiceMappingsForTest(IPServiceMap)
+				i.lb.ForTest().SetIPServiceMappings(IPServiceMap)
 
 				i.atomicIsVIPServiceIPFunc.Store(func(addr netip.Addr) bool {
 					return addr == serviceIP
@@ -705,6 +710,50 @@ func tcp4syn(tb testing.TB, src, dst netip.Addr, sport, dport uint16) []byte {
 	return ip
 }
 
+// tcp6syn is tcp4syn for IPv6 packets.
+func tcp6syn(tb testing.TB, src, dst netip.Addr, sport, dport uint16) []byte {
+	srcAddr := tcpip.AddrFrom16(src.As16())
+	dstAddr := tcpip.AddrFrom16(dst.As16())
+
+	ip := header.IPv6(make([]byte, header.IPv6MinimumSize+header.TCPMinimumSize))
+	ip.Encode(&header.IPv6Fields{
+		SrcAddr:           srcAddr,
+		DstAddr:           dstAddr,
+		PayloadLength:     header.TCPMinimumSize,
+		TransportProtocol: header.TCPProtocolNumber,
+		HopLimit:          64,
+	})
+
+	tcp := header.TCP(ip[header.IPv6MinimumSize:])
+	tcp.Encode(&header.TCPFields{
+		SrcPort:    sport,
+		DstPort:    dport,
+		SeqNum:     0,
+		DataOffset: header.TCPMinimumSize,
+		Flags:      header.TCPFlagSyn,
+		WindowSize: 65535,
+		Checksum:   0,
+	})
+	xsum := header.PseudoHeaderChecksum(header.TCPProtocolNumber, srcAddr, dstAddr,
+		uint16(header.TCPMinimumSize))
+	tcp.SetChecksum(^tcp.CalculateChecksum(xsum))
+	if !tcp.IsChecksumValid(srcAddr, dstAddr, 0, 0) {
+		tb.Fatal("test broken; packet has incorrect TCP checksum")
+	}
+
+	return ip
+}
+
+// mustVia99 returns the 4via6 address embedding v4 within site 99's /96.
+func mustVia99(tb testing.TB, v4 string) netip.Addr {
+	tb.Helper()
+	p, err := tsaddr.MapVia(99, netip.PrefixFrom(netip.MustParseAddr(v4), 32))
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return p.Addr()
+}
+
 // makeHangDialer returns a dialer that notifies the returned channel when a
 // connection is dialed and then hangs until the test finishes.
 func makeHangDialer(tb testing.TB) (netx.DialFunc, chan struct{}) {
@@ -737,7 +786,8 @@ func makeHangDialer(tb testing.TB) (netx.DialFunc, chan struct{}) {
 // TestTCPForwardLimits verifies that the limits on the TCP forwarder work in a
 // success case (i.e. when we don't hit the limit).
 func TestTCPForwardLimits(t *testing.T) {
-	envknob.Setenv("TS_DEBUG_NETSTACK", "true")
+	envknob.SetenvForTest(t, "TS_DEBUG_NETSTACK", "true")
+
 	impl := makeNetstack(t, func(impl *Impl) {
 		impl.ProcessSubnets = true
 	})
@@ -813,8 +863,7 @@ func TestTCPForwardLimits(t *testing.T) {
 // forwarding works.
 func TestTCPForwardLimits_PerClient(t *testing.T) {
 	clientmetric.ResetForTest(t)
-	tstest.AssertNotParallel(t) // calls envknob.Setenv
-	envknob.Setenv("TS_DEBUG_NETSTACK", "true")
+	envknob.SetenvForTest(t, "TS_DEBUG_NETSTACK", "true")
 
 	// Set our test override limits during this test.
 	maxInFlightConnectionAttemptsForTest.Store(2)
@@ -950,7 +999,7 @@ func TestHandleLocalPackets(t *testing.T) {
 		netip.MustParseAddr("100.99.55.111"):        "svc:test-service",
 		netip.MustParseAddr("fd7a:115c:a1e0::abcd"): "svc:test-service",
 	}
-	impl.lb.SetIPServiceMappingsForTest(IPServiceMap)
+	impl.lb.ForTest().SetIPServiceMappings(IPServiceMap)
 
 	t.Run("ShouldHandleServiceIP", func(t *testing.T) {
 		t.Parallel()
@@ -1089,6 +1138,30 @@ func TestHandleLocalPackets(t *testing.T) {
 			t.Errorf("got filter outcome %v, want filter.DropSilently", resp)
 		}
 	})
+	t.Run("ShouldNotHandleInactiveVIPService", func(t *testing.T) {
+		// Tests that packets to Tailscale Services we don't host are accepted.
+		inactiveVIP := netip.MustParseAddr("100.99.55.222")
+		impl.lb.ForTest().SetIPServiceMappings(netmap.IPServiceMappings{
+			netip.MustParseAddr("100.99.55.111"):        "svc:test-service", // active (shared fixture)
+			netip.MustParseAddr("fd7a:115c:a1e0::abcd"): "svc:test-service",
+			inactiveVIP: "svc:inactive-elsewhere",
+		})
+		t.Cleanup(func() {
+			// Restore the shared fixture for any later/parallel subtests.
+			impl.lb.ForTest().SetIPServiceMappings(IPServiceMap)
+		})
+		pkt := &packet.Parsed{
+			IPVersion: 4,
+			IPProto:   ipproto.TCP,
+			Src:       netip.MustParseAddrPort("127.0.0.1:9999"),
+			Dst:       netip.AddrPortFrom(inactiveVIP, 80),
+			TCPFlags:  packet.TCPSyn,
+		}
+		resp, _ := impl.handleLocalPackets(pkt, impl.tundev, nil)
+		if resp != filter.Accept {
+			t.Errorf("inactive VIP service: got filter outcome %v, want filter.Accept (pass through to host)", resp)
+		}
+	})
 	t.Run("OtherNonHandled", func(t *testing.T) {
 		t.Parallel()
 		pkt := &packet.Parsed{
@@ -1113,97 +1186,364 @@ func TestHandleLocalPackets(t *testing.T) {
 	})
 }
 
-// TestQuad100UnservedTCPPortDoesNotForward verifies that a TCP SYN to the
-// Tailscale service IP (100.100.100.100) on a port we don't serve is
-// absorbed by netstack and rejected cleanly, without triggering the
-// outbound forwardTCP dialer.
+// TestAcceptTCPRoutingTailscaleIPRange tests how acceptTCP behaves for TCP SYN
+// packets destined to IPs in the Tailscale range (100.64.0.0/10).
 //
-// handleLocalPackets now absorbs all quad-100 traffic regardless of
-// port to prevent it leaking to WireGuard peers (which produced noisy
-// "open-conn-track: timeout opening ...; no associated peer node" log
-// lines). That leaves acceptTCP responsible for rejecting connections
-// to ports we don't handle; without an explicit guard, execution would
-// fall through to the isTailscaleIP case (quad-100 is in the tailscale
-// range), rewriting the dial target to 127.0.0.1:<port> and forwarding
-// the connection to whatever random service happened to be listening
-// on the host's loopback at that port.
-//
-// This test asserts that the forward dialer is NOT invoked for quad-100
-// SYNs on unserved ports; the guard in acceptTCP must RST instead.
-func TestQuad100UnservedTCPPortDoesNotForward(t *testing.T) {
+//   - Packets to the Tailscale IP should be forwarded to loopback if there is
+//     no configured handler for the port.
+//   - Packets to the service IP (100.100.100.100) on non-served ports should
+//     never make it to the local host.
+//   - Packets to a Tailscale Service VIP on non-served ports should never make
+//     it to the local host.
+func TestAcceptTCPLoopbackForwardVsRST(t *testing.T) {
+	serviceVIP := netip.MustParseAddr("100.90.1.2")
+	selfIP := netip.MustParseAddr("100.64.1.2")
+	const serviceName = "svc:test"
+
+	cases := []struct {
+		name string
+		// configure runs inside makeNetstack, before Start.
+		configure func(*Impl)
+		// afterStart runs after Start, for state that requires the backend to be
+		// running (prefs, service IP maps, NIC address registration). Optional.
+		afterStart func(t *testing.T, impl *Impl)
+		// dst is the SYN's destination. Its port has no registered handler.
+		dst netip.AddrPort
+		// inbound selects the injection path: true => injectInbound (a packet
+		// from a peer), false => handleLocalPackets (host-originated, or the
+		// kernel-hairpin re-entry).
+		inbound bool
+		// wantForward is whether acceptTCP should forward the connection to the
+		// host's loopback (true) or reject it with a RST (false).
+		wantForward bool
+	}{
+		{
+			name: "Quad-100UnservedPortIsRST",
+			configure: func(impl *Impl) {
+				impl.ProcessSubnets = false
+				impl.ProcessLocalIPs = false
+				impl.atomicIsLocalIPFunc.Store(looksLikeATailscaleSelfAddress)
+			},
+			// 853 is DoT, the specific case called out in the original bug
+			// report ("conntrack error no peer found for 100.100.100.100:853").
+			// Before the fix, port 853 (and any non-{53,80,8080} port) leaked
+			// out to WireGuard; after the fix it is absorbed and must NOT
+			// trigger forwardTCP. handleLocalPackets absorbs all quad-100
+			// traffic regardless of port to prevent it leaking to WireGuard
+			// peers (which produced noisy "open-conn-track: timeout opening ...;
+			// no associated peer node" log lines), leaving acceptTCP to reject
+			// the unserved port with a RST rather than falling through to the
+			// isTailscaleIP loopback rewrite.
+			dst:         netip.AddrPortFrom(tsaddr.TailscaleServiceIP(), 853),
+			wantForward: false,
+		},
+		{
+			name: "VIPServiceUnservedPortIsRST",
+			configure: func(impl *Impl) {
+				impl.ProcessSubnets = false
+				impl.ProcessLocalIPs = false
+				impl.atomicIsLocalIPFunc.Store(looksLikeATailscaleSelfAddress)
+				impl.atomicIsVIPServiceIPFunc.Store(func(addr netip.Addr) bool {
+					return addr == serviceVIP
+				})
+			},
+			afterStart: func(t *testing.T, impl *Impl) {
+				// Mark the service as one this node hosts and is actively
+				// serving, so handleLocalPackets absorbs its traffic into
+				// netstack (rather than letting a non-hosted VIP route through).
+				// The service serves no TCP ports here, so every port is
+				// "non-served". AdvertiseServices flows through to
+				// UpdateActiveVIPServices, marking the service active.
+				prefs := ipn.NewPrefs()
+				prefs.AdvertiseServices = []string{serviceName}
+				if _, err := impl.lb.EditPrefs(&ipn.MaskedPrefs{
+					Prefs:                *prefs,
+					AdvertiseServicesSet: true,
+				}); err != nil {
+					t.Fatalf("EditPrefs: %v", err)
+				}
+				impl.lb.ForTest().SetIPServiceMappings(netmap.IPServiceMappings{serviceVIP: serviceName})
+			},
+			dst:         netip.AddrPortFrom(serviceVIP, 8001), // 8001: a port the service doesn't serve
+			wantForward: false,
+		},
+		{
+			name: "LocalTailscaleIPUnhandledPortForwardsToLoopback",
+			configure: func(impl *Impl) {
+				impl.ProcessSubnets = false
+				// ProcessLocalIPs=true so an inbound packet to a local Tailscale
+				// IP is absorbed into netstack and dispatched to acceptTCP.
+				impl.ProcessLocalIPs = true
+				impl.atomicIsLocalIPFunc.Store(func(addr netip.Addr) bool {
+					return addr == selfIP
+				})
+			},
+			// 9999 has no SSH/webclient/peerapi/serve handler, so
+			// TCPHandlerForDst returns nil and acceptTCP falls to the
+			// isTailscaleIP case, which rewrites the dial to 127.0.0.1:9999 and
+			// calls forwardTCP. This is how local handlers reach the host, and
+			// the RST guards above must not swallow it.
+			dst:         netip.AddrPortFrom(selfIP, 9999),
+			inbound:     true,
+			wantForward: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			impl := makeNetstack(t, tc.configure)
+			if tc.afterStart != nil {
+				tc.afterStart(t, impl)
+			}
+
+			dialFn, gotConn := makeHangDialer(t)
+			impl.forwardDialFunc = dialFn
+
+			// Use a client IP in the CGNAT range so shouldProcessInbound-adjacent
+			// code paths treat this as plausibly-peer-sourced traffic, matching
+			// what a real stray probe from a peer or the host OS would look like.
+			client := netip.MustParseAddr("100.101.102.103")
+			pkt := tcp4syn(t, client, tc.dst.Addr(), 1234, tc.dst.Port())
+			var parsed packet.Parsed
+			parsed.Decode(pkt)
+
+			// Both injection paths absorb the packet into netstack, returning
+			// filter.DropSilently (i.e. not handing it to the host); acceptTCP
+			// is then dispatched with the packet.
+			inject := impl.handleLocalPackets
+			if tc.inbound {
+				inject = impl.injectInbound
+			}
+			if resp, _ := inject(&parsed, impl.tundev, nil); resp != filter.DropSilently {
+				t.Fatalf("inject for %v: got filter outcome %v, want filter.DropSilently", tc.dst, resp)
+			}
+
+			// acceptTCP runs asynchronously in the gVisor TCP dispatcher after
+			// handleLocalPackets injects the packet into netstack. Use the
+			// in-flight connection counter as a deterministic synchronization
+			// point: wrapTCPProtocolHandler increments connsInFlightByClient
+			// when the dispatcher hands the connection off to acceptTCP, and
+			// acceptTCP's deferred decrementInFlightTCPForward decrements it
+			// on return.
+			//
+			// On the green path (RST guard fires), acceptTCP returns promptly
+			// and the counter reaches 0. On the red path (fall-through to
+			// forwardTCP), acceptTCP blocks inside the forwardDialFunc call —
+			// makeHangDialer signals gotConn on entry (buffered, non-blocking)
+			// and then blocks forever — so the counter never reaches 0 but
+			// gotConn fires synchronously from the dispatcher goroutine. A
+			// select on both races those outcomes without real-time padding.
+			//
+			// testing/synctest is not usable here: gVisor's sleep package calls
+			// the runtime's gopark directly rather than via the standard
+			// library, so synctest.Wait() cannot observe those goroutines
+			// becoming durably blocked and hangs indefinitely.
+			inFlightZero := make(chan struct{})
+			go func() {
+				for {
+					impl.mu.Lock()
+					n := impl.connsInFlightByClient[client]
+					impl.mu.Unlock()
+					if n == 0 {
+						close(inFlightZero)
+						return
+					}
+					time.Sleep(time.Millisecond)
+				}
+			}()
+
+			select {
+			case <-gotConn:
+				if !tc.wantForward {
+					t.Fatalf("forwardDialFunc was called for %v; acceptTCP forwarded to the host's loopback instead of sending a RST", tc.dst)
+				}
+			case <-inFlightZero:
+				if tc.wantForward {
+					t.Fatalf("forwardDialFunc was NOT called for %v; acceptTCP rejected the connection instead of forwarding it to loopback", tc.dst)
+				}
+			case <-time.After(5 * time.Second):
+				// Safety net so a regression in the in-flight counter plumbing
+				// doesn't hang the whole test run; both outcomes above should
+				// fire within milliseconds in practice.
+				t.Fatalf("timed out waiting for acceptTCP to dispatch %v SYN", tc.dst)
+			}
+		})
+	}
+}
+
+// TestShouldHandlePingViaHostScoped verifies that ping relay for 4via6
+// addresses embedding host-scoped IPv4 destinations is refused.
+func TestShouldHandlePingViaHostScoped(t *testing.T) {
+	srcIP := netip.AddrFrom4([4]byte{1, 2, 3, 4})
+	pingPkt := func(dst netip.Addr) *packet.Parsed {
+		icmph := packet.ICMP6Header{
+			IP6Header: packet.IP6Header{
+				IPProto: ipproto.ICMPv6,
+				Src:     srcIP,
+				Dst:     dst,
+			},
+			Type: packet.ICMP6EchoRequest,
+			Code: packet.ICMP6NoCode,
+		}
+		_, payload := packet.ICMPEchoPayload(nil)
+		pkt := &packet.Parsed{}
+		pkt.Decode(packet.Generate(icmph, payload))
+		return pkt
+	}
+
+	cases := []struct {
+		name   string
+		v4     string
+		wantOK bool
+	}{
+		{"SiteHost", "10.1.1.9", true},
+		{"Metadata", "169.254.169.254", false},
+		{"Loopback", "127.0.0.1", false},
+		{"TailscaleCGNAT", "100.64.1.2", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			impl := makeNetstack(t, func(impl *Impl) {
+				impl.ProcessSubnets = true
+			})
+			dst := mustVia99(t, tc.v4)
+			pingDst, ok := impl.shouldHandlePing(pingPkt(dst))
+			if ok != tc.wantOK {
+				t.Fatalf("shouldHandlePing(%v) ok = %v, want %v", dst, ok, tc.wantOK)
+			}
+			if ok && pingDst != netip.MustParseAddr(tc.v4) {
+				t.Errorf("shouldHandlePing(%v) pingDst = %v, want %v", dst, pingDst, tc.v4)
+			}
+		})
+	}
+}
+
+// TestAcceptTCPViaHostScoped is a regression test for the 4via6 filter
+// bypass: the packet filter only sees the outer via address, so acceptTCP
+// must police the unmapped destination itself. SYNs to via addresses
+// embedding host-scoped IPv4 destinations must be RST without invoking the
+// forward dialer; ordinary site destinations must still be forwarded.
+func TestAcceptTCPViaHostScoped(t *testing.T) {
+	viaPrefix := netip.MustParsePrefix("fd7a:115c:a1e0:b1a:0:63::/96") // site 99
+
+	cases := []struct {
+		name string
+		dst  netip.AddrPort
+		// wantForward is if acceptTCP should dial the target or reject the connection with a RST
+		wantForward bool
+	}{
+		{"MetadataBlocked", netip.AddrPortFrom(mustVia99(t, "169.254.169.254"), 80), false},
+		{"LoopbackBlocked", netip.AddrPortFrom(mustVia99(t, "127.0.0.1"), 22), false},
+		{"TailscaleCGNATBlocked", netip.AddrPortFrom(mustVia99(t, "100.64.3.4"), 80), false},
+		{"SiteHostAllowed", netip.AddrPortFrom(mustVia99(t, "10.0.0.1"), 80), true},
+		{"SiteNetworkAllowed", netip.AddrPortFrom(mustVia99(t, "10.0.0.0"), 80), true},
+		{"SiteBroadcastAllowed", netip.AddrPortFrom(mustVia99(t, "10.0.0.255"), 80), true},
+		{"SiteLastHostAllowed", netip.AddrPortFrom(mustVia99(t, "10.0.0.254"), 80), true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			impl := makeNetstack(t, func(impl *Impl) {
+				impl.ProcessSubnets = true
+			})
+			// Advertise the via prefix so ShouldHandleViaIP accepts the dst
+			prefs := ipn.NewPrefs()
+			prefs.AdvertiseRoutes = []netip.Prefix{viaPrefix}
+			impl.lb.Start(ipn.Options{UpdatePrefs: prefs})
+			impl.atomicIsLocalIPFunc.Store(looksLikeATailscaleSelfAddress)
+
+			dialFn, gotConn := makeHangDialer(t)
+			impl.forwardDialFunc = dialFn
+
+			client := tsaddr.Tailscale4To6(netip.MustParseAddr("100.101.102.103"))
+			pkt := tcp6syn(t, client, tc.dst.Addr(), 1234, tc.dst.Port())
+			var parsed packet.Parsed
+			parsed.Decode(pkt)
+
+			if resp, _ := impl.injectInbound(&parsed, impl.tundev, nil); resp != filter.DropSilently {
+				t.Fatalf("inject for %v: got filter outcome %v, want filter.DropSilently", tc.dst, resp)
+			}
+
+			// Same synchronization as TestAcceptTCPLoopbackForwardVsRST:
+			// the in-flight counter reaching 0 means acceptTCP returned
+			// (RST path); gotConn firing means it called forwardTCP.
+			inFlightZero := make(chan struct{})
+			go func() {
+				for {
+					impl.mu.Lock()
+					n := impl.connsInFlightByClient[client]
+					impl.mu.Unlock()
+					if n == 0 {
+						close(inFlightZero)
+						return
+					}
+					time.Sleep(time.Millisecond)
+				}
+			}()
+
+			select {
+			case <-gotConn:
+				if !tc.wantForward {
+					t.Fatalf("forwardDialFunc was called for %v; acceptTCP forwarded a host-scoped 4via6 target instead of sending a RST", tc.dst)
+				}
+			case <-inFlightZero:
+				if tc.wantForward {
+					t.Fatalf("forwardDialFunc was NOT called for %v; acceptTCP rejected a legitimate 4via6 target", tc.dst)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatalf("timed out waiting for acceptTCP to dispatch %v SYN", tc.dst)
+			}
+		})
+	}
+}
+
+// TestForwardUDPViaHostScoped is a regression test for the 4via6 filter
+// bypass: the packet filter only sees the outer via address, so forwardUDP
+// must police the unmapped destination itself. UDP flows to via addresses
+// embedding host-scoped IPv4 destinations must be dropped before any backend
+// socket is created, and the drop must close the client endpoint: acceptUDP
+// runs forwardUDP in a goroutine, so nothing else would.
+func TestForwardUDPViaHostScoped(t *testing.T) {
+	tstest.AssertNotParallel(t) // calls clientmetric.ResetForTest
+	clientmetric.ResetForTest(t)
+
 	impl := makeNetstack(t, func(impl *Impl) {
-		impl.ProcessSubnets = false
-		impl.ProcessLocalIPs = false
 		impl.atomicIsLocalIPFunc.Store(looksLikeATailscaleSelfAddress)
 	})
 
-	dialFn, gotConn := makeHangDialer(t)
-	impl.forwardDialFunc = dialFn
-
-	// Use a client IP in the CGNAT range so shouldProcessInbound-adjacent
-	// code paths treat this as plausibly-peer-sourced traffic, matching
-	// what a real stray quad-100 probe from the host OS would look like.
-	client := netip.MustParseAddr("100.101.102.103")
-	quad100 := tsaddr.TailscaleServiceIP()
-
-	// 853 is DoT, the specific case called out in the original bug
-	// report ("conntrack error no peer found for 100.100.100.100:853").
-	// Before the fix, port 853 (and any non-{53,80,8080} port) leaked
-	// out to WireGuard; after the fix it is absorbed here and must NOT
-	// trigger forwardTCP.
-	pkt := tcp4syn(t, client, quad100, 1234, 853)
-	var parsed packet.Parsed
-	parsed.Decode(pkt)
-
-	resp, _ := impl.handleLocalPackets(&parsed, impl.tundev, nil)
-	if resp != filter.DropSilently {
-		t.Fatalf("handleLocalPackets for quad-100:853: got %v, want filter.DropSilently", resp)
+	client := tsaddr.Tailscale4To6(netip.MustParseAddr("100.101.102.103"))
+	blocked := []string{
+		"127.0.0.1",
+		"169.254.169.254", // port 80 below: metadata
+		"100.64.1.2",
+		"224.0.0.1",
+		"0.0.0.0",
+		"255.255.255.255",
 	}
+	for i, v4 := range blocked {
+		dst := netip.AddrPortFrom(mustVia99(t, v4), 80)
 
-	// acceptTCP runs asynchronously in the gVisor TCP dispatcher after
-	// handleLocalPackets injects the packet into netstack. Use the
-	// in-flight connection counter as a deterministic synchronization
-	// point: wrapTCPProtocolHandler increments connsInFlightByClient
-	// when the dispatcher hands the connection off to acceptTCP, and
-	// acceptTCP's deferred decrementInFlightTCPForward decrements it
-	// on return.
-	//
-	// On the green path (RST guard fires), acceptTCP returns promptly
-	// and the counter reaches 0. On the red path (fall-through to
-	// forwardTCP), acceptTCP blocks inside the forwardDialFunc call —
-	// makeHangDialer signals gotConn on entry (buffered, non-blocking)
-	// and then blocks forever — so the counter never reaches 0 but
-	// gotConn fires synchronously from the dispatcher goroutine. A
-	// select on both races those outcomes without real-time padding.
-	//
-	// testing/synctest is not usable here: gVisor's sleep package calls
-	// the runtime's gopark directly rather than via the standard
-	// library, so synctest.Wait() cannot observe those goroutines
-	// becoming durably blocked and hangs indefinitely.
-	inFlightZero := make(chan struct{})
-	go func() {
-		for {
-			impl.mu.Lock()
-			n := impl.connsInFlightByClient[client]
-			impl.mu.Unlock()
-			if n == 0 {
-				close(inFlightZero)
-				return
-			}
-			time.Sleep(time.Millisecond)
+		// A bare endpoint suffices: the drop path only closes the conn; dialing would need real routes
+		var wq waiter.Queue
+		ep, err := impl.ipstack.NewEndpoint(udp.ProtocolNumber, ipv6.ProtocolNumber, &wq)
+		if err != nil {
+			t.Fatalf("NewEndpoint: %v", err)
 		}
-	}()
+		conn := gonet.NewUDPConn(&wq, ep)
 
-	select {
-	case <-gotConn:
-		t.Fatalf("forwardDialFunc was called for quad-100:853; acceptTCP fell through to forwardTCP instead of sending RST. This means stray traffic to quad-100 on unserved ports is being redirected to the host's loopback at the same port.")
-	case <-inFlightZero:
-		// acceptTCP returned cleanly; the RST guard fired.
-	case <-time.After(5 * time.Second):
-		// Safety net so a regression in the in-flight counter plumbing
-		// doesn't hang the whole test run; both outcomes above should
-		// fire within milliseconds in practice.
-		t.Fatal("timed out waiting for acceptTCP to dispatch quad-100:853 SYN")
+		// Distinct source port per flow; the guard runs synchronously, so no waiting is needed
+		before := metricViaHostScopedDrop.Value()
+		impl.forwardUDP(conn, netip.AddrPortFrom(client, uint16(1000+i)), dst)
+
+		if got := metricViaHostScopedDrop.Value() - before; got != 1 {
+			t.Errorf("UDP to %v: drop metric delta = %d, want 1 (guard did not fire)", dst, got)
+		}
+		// ep.Read never blocks (no gonet retry loop): ErrClosedForReceive iff the guard closed the conn
+		w := tcpip.SliceWriter(make([]byte, 1))
+		_, rerr := ep.Read(&w, tcpip.ReadOptions{})
+		if _, closed := rerr.(*tcpip.ErrClosedForReceive); !closed {
+			t.Errorf("after UDP to %v: client endpoint Read = %v, want ErrClosedForReceive", dst, rerr)
+		}
 	}
 }
 
@@ -1674,6 +2014,114 @@ func udp4raw(t testing.TB, src, dst netip.Addr, sport, dport uint16, payload []b
 	)
 	u.SetChecksum(^header.UDP(buf[header.IPv4MinimumSize:]).CalculateChecksum(xsum))
 	return buf
+}
+
+func fragmentIPv4ForTest(t testing.TB, pkt []byte, firstPayloadLen uint16) (first, second []byte) {
+	t.Helper()
+	if firstPayloadLen%8 != 0 {
+		t.Fatalf("firstPayloadLen %d is not 8-byte aligned", firstPayloadLen)
+	}
+	if len(pkt) < header.IPv4MinimumSize+int(firstPayloadLen) {
+		t.Fatalf("packet length %d too short for firstPayloadLen %d", len(pkt), firstPayloadLen)
+	}
+	ip := header.IPv4(pkt)
+	if ip.HeaderLength() != header.IPv4MinimumSize {
+		t.Fatalf("test helper only supports 20-byte IPv4 headers; got %d", ip.HeaderLength())
+	}
+	ipPayloadLen := len(pkt) - header.IPv4MinimumSize
+	if int(firstPayloadLen) >= ipPayloadLen {
+		t.Fatalf("firstPayloadLen %d must be smaller than IP payload length %d", firstPayloadLen, ipPayloadLen)
+	}
+
+	first = make([]byte, header.IPv4MinimumSize+int(firstPayloadLen))
+	copy(first, pkt[:len(first)])
+	firstIP := header.IPv4(first)
+	firstIP.SetTotalLength(uint16(len(first)))
+	firstIP.SetFlagsFragmentOffset(header.IPv4FlagMoreFragments, 0)
+	firstIP.SetChecksum(0)
+	firstIP.SetChecksum(^firstIP.CalculateChecksum())
+
+	secondPayloadLen := ipPayloadLen - int(firstPayloadLen)
+	second = make([]byte, header.IPv4MinimumSize+secondPayloadLen)
+	copy(second[:header.IPv4MinimumSize], pkt[:header.IPv4MinimumSize])
+	copy(second[header.IPv4MinimumSize:], pkt[header.IPv4MinimumSize+int(firstPayloadLen):])
+	secondIP := header.IPv4(second)
+	secondIP.SetTotalLength(uint16(len(second)))
+	secondIP.SetFlagsFragmentOffset(0, firstPayloadLen)
+	secondIP.SetChecksum(0)
+	secondIP.SetChecksum(^secondIP.CalculateChecksum())
+
+	return first, second
+}
+
+// TestLinkEndpointInjectInboundIPv4Fragments verifies that Tailscale's inbound
+// link endpoint path lets IPv4 fragments reach gVisor for reassembly.
+// Previously (see https://github.com/tailscale/tailscale/issues/20320),
+// gro.RXChecksumOffload validated L4 checksums before reassembly, so the first
+// fragment was dropped and the UDP datagram never reached the socket.
+func TestLinkEndpointInjectInboundIPv4Fragments(t *testing.T) {
+	const nicID tcpip.NICID = 1
+	localIP := netip.MustParseAddr("100.64.1.2")
+	remoteIP := netip.MustParseAddr("100.64.1.3")
+	payload := []byte("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz")
+	raw := udp4raw(t, remoteIP, localIP, 12345, 8081, payload)
+	first, second := fragmentIPv4ForTest(t, raw, 80)
+
+	s := stack.New(stack.Options{
+		NetworkProtocols: []stack.NetworkProtocolFactory{
+			ipv4.NewProtocol,
+		},
+		TransportProtocols: []stack.TransportProtocolFactory{
+			udp.NewProtocol,
+		},
+	})
+	defer s.Close()
+
+	ep := newLinkEndpoint(64, 1280, "", groNotSupported)
+	if err := s.CreateNIC(nicID, ep); err != nil {
+		t.Fatalf("CreateNIC: %v", err)
+	}
+	if err := s.AddProtocolAddress(nicID, tcpip.ProtocolAddress{
+		Protocol:          header.IPv4ProtocolNumber,
+		AddressWithPrefix: tcpip.AddrFrom4(localIP.As4()).WithPrefix(),
+	}, stack.AddressProperties{}); err != nil {
+		t.Fatalf("AddProtocolAddress: %v", err)
+	}
+
+	pc, err := gonet.DialUDP(s, &tcpip.FullAddress{
+		NIC:  nicID,
+		Addr: tcpip.AddrFrom4(localIP.As4()),
+		Port: 8081,
+	}, nil, header.IPv4ProtocolNumber)
+	if err != nil {
+		t.Fatalf("DialUDP: %v", err)
+	}
+	defer pc.Close()
+
+	var parsed packet.Parsed
+	parsed.Decode(first)
+	ep.injectInbound(&parsed)
+	parsed.Decode(second)
+	ep.injectInbound(&parsed)
+
+	if err := pc.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	buf := make([]byte, 512)
+	n, addr, err := pc.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("ReadFrom: %v (fragmented packet was not reassembled and delivered)", err)
+	}
+	if got := string(buf[:n]); got != string(payload) {
+		t.Fatalf("payload = %q, want %q", got, payload)
+	}
+	udpAddr, ok := addr.(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("remote addr = %T(%v), want *net.UDPAddr", addr, addr)
+	}
+	if got := udpAddr.AddrPort(); got != netip.MustParseAddrPort("100.64.1.3:12345") {
+		t.Fatalf("remote addr = %v, want 100.64.1.3:12345", got)
+	}
 }
 
 // TestInjectLoopback verifies that the inject goroutine delivers self-addressed
