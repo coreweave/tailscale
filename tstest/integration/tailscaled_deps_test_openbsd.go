@@ -10,7 +10,6 @@ import (
 	// Otherwise cmd/go never sees that we depend on these packages'
 	// transitive deps when we run "go install tailscaled" in a child
 	// process and can cache a prior success when a dependency changes.
-	_ "tailscale.com/chirp"
 	_ "tailscale.com/client/local"
 	_ "tailscale.com/cmd/tailscaled/childproc"
 	_ "tailscale.com/control/controlclient"
@@ -32,6 +31,7 @@ import (
 	_ "tailscale.com/logpolicy"
 	_ "tailscale.com/logtail"
 	_ "tailscale.com/net/dns"
+	_ "tailscale.com/net/dnscache"
 	_ "tailscale.com/net/dnsfallback"
 	_ "tailscale.com/net/netmon"
 	_ "tailscale.com/net/netns"
@@ -43,6 +43,7 @@ import (
 	_ "tailscale.com/safesocket"
 	_ "tailscale.com/syncs"
 	_ "tailscale.com/tailcfg"
+	_ "tailscale.com/tsconst"
 	_ "tailscale.com/tsd"
 	_ "tailscale.com/tsweb/varz"
 	_ "tailscale.com/types/flagtype"
@@ -52,6 +53,7 @@ import (
 	_ "tailscale.com/util/clientmetric"
 	_ "tailscale.com/util/eventbus"
 	_ "tailscale.com/util/osshare"
+	_ "tailscale.com/util/syspolicy"
 	_ "tailscale.com/util/syspolicy/pkey"
 	_ "tailscale.com/util/syspolicy/policyclient"
 	_ "tailscale.com/version"

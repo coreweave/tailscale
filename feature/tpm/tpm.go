@@ -41,7 +41,9 @@ var (
 )
 
 func init() {
-	feature.Register("tpm")
+	if !feature.Register("tpm") {
+		return
+	}
 	feature.HookTPMAvailable.Set(tpmSupportedOnce)
 	feature.HookHardwareAttestationAvailable.Set(tpmSupportedOnce)
 
@@ -243,8 +245,11 @@ func (s *tpmStore) WriteState(k ipn.StateKey, bs []byte) error {
 	if bytes.Equal(s.cache[k], bs) {
 		return nil
 	}
-	s.cache[k] = bytes.Clone(bs)
-
+	if bs == nil {
+		delete(s.cache, k)
+	} else {
+		s.cache[k] = bytes.Clone(bs)
+	}
 	return s.writeSealed()
 }
 

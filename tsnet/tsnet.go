@@ -116,6 +116,21 @@
 //	})
 //	log.Printf("Listening on https://%s", ln.FQDN)
 //
+// # Using an exit node
+//
+// A tsnet node can route its [Server.Dial] traffic to non-tailnet
+// addresses through an [exit node]. Select the exit node by setting the
+// ExitNodeID pref via [Server.LocalClient]:
+//
+//	lc, _ := srv.LocalClient()
+//	_, err := lc.EditPrefs(ctx, &ipn.MaskedPrefs{
+//		Prefs:         ipn.Prefs{ExitNodeID: "nodeid"},
+//		ExitNodeIDSet: true,
+//	})
+//
+// Dials of addresses outside the tailnet then go through the exit node.
+// Dials within the tailnet are unaffected.
+//
 // # Running multiple nodes in one process
 //
 // Each [Server] instance is an independent node. Give each a unique
@@ -132,6 +147,7 @@
 //	}
 //
 // [Tailscale identity]: https://tailscale.com/docs/concepts/tailscale-identity
+// [exit node]: https://tailscale.com/docs/features/exit-nodes
 // [Tailscale Funnel]: https://tailscale.com/docs/features/tailscale-funnel
 // [Tailscale Service]: https://tailscale.com/docs/features/tailscale-services
 package tsnet
@@ -163,6 +179,7 @@ import (
 	"tailscale.com/control/controlclient"
 	"tailscale.com/envknob"
 	_ "tailscale.com/feature/c2n"
+	_ "tailscale.com/feature/condregister/netlog"
 	_ "tailscale.com/feature/condregister/oauthkey"
 	_ "tailscale.com/feature/condregister/portmapper"
 	_ "tailscale.com/feature/condregister/useproxy"
@@ -185,6 +202,7 @@ import (
 	"tailscale.com/net/socks5"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/peercap"
 	"tailscale.com/tsd"
 	"tailscale.com/types/bools"
 	"tailscale.com/types/logger"
@@ -249,6 +267,15 @@ type Server struct {
 	// previously stored in Store), then this field is not
 	// used.
 	AuthKey string
+
+	// SSHAuthCallback is called for each new SSH session on listeners
+	// from [Server.ListenSSH]. It receives the peer's Tailscale
+	// identity, the same values as Session.Peer and
+	// Session.UserProfile. A session that it rejects is refused and is
+	// never yielded to Accept. If it is nil, every session from a peer
+	// that the tailnet ACL's TCP rules allow is accepted. See
+	// [SSHAuthCallback].
+	SSHAuthCallback SSHAuthCallback
 
 	// ClientSecret, if non-empty, is the OAuth client secret
 	// that will be used to generate authkeys via OAuth. It
@@ -395,12 +422,24 @@ func (s *Server) awaitRunning(ctx context.Context) error {
 //
 // This is useful if you need to have your tsnet services connect to other devices on
 // your tailnet.
+//
+// The returned client's transport has the same settings as
+// [http.DefaultTransport], except its DialContext dials over Tailscale
+// and it has no Proxy set, as HTTP proxies from the environment are
+// unlikely to be reachable over the tailnet.
 func (s *Server) HTTPClient() *http.Client {
-	return &http.Client{
-		Transport: &http.Transport{
-			DialContext: s.Dial,
-		},
+	// Keep this in sync with http.DefaultTransport. Do not clone
+	// http.DefaultTransport here: applications are permitted to replace or
+	// modify that package-level variable.
+	tr := &http.Transport{
+		DialContext:           s.Dial,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
 	}
+	return &http.Client{Transport: tr}
 }
 
 // LocalClient returns a LocalClient that speaks to s.
@@ -664,7 +703,16 @@ func (s *Server) close() {
 	}
 
 	wg.Wait()
-	s.sys.Bus.Get().Close()
+	// s.sys is only assigned partway through doInit, so it is still nil if
+	// Start failed before that point. Close is reachable in that state --
+	// Start is idempotent via initOnce and returns the stored initErr, so
+	// callers that `defer Close()` before checking the error land here.
+	// Use GetOK rather than Get so an unset Bus cannot panic either.
+	if s.sys != nil {
+		if bus, ok := s.sys.Bus.GetOK(); ok && bus != nil {
+			bus.Close()
+		}
+	}
 }
 
 func (s *Server) doInit() {
@@ -885,7 +933,8 @@ func (s *Server) start() (reterr error) {
 	ns.GetUDPHandlerForFlow = s.getUDPHandlerForFlow
 	s.netstack = ns
 	s.dialer.UseNetstackForIP = func(ip netip.Addr) bool {
-		_, ok := eng.PeerForIP(ip)
+		// s.lb is assigned below, before any dials can happen.
+		_, ok := s.lb.PeerForIP(ip)
 		return ok
 	}
 	s.dialer.NetstackDialTCP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
@@ -1005,7 +1054,10 @@ func (s *Server) resolveAuthKey() (string, error) {
 		if authKey == "" {
 			clientSecret = s.getClientSecret()
 		}
-		authKey, err = resolveViaOAuth(s.shutdownCtx, clientSecret, s.AdvertiseTags)
+		authKey, err = resolveViaOAuth(s.shutdownCtx, tailscale.ResolveAuthKeyArgs{
+			AuthKey: clientSecret,
+			Tags:    s.AdvertiseTags,
+		})
 		if err != nil {
 			return "", err
 		}
@@ -1031,7 +1083,13 @@ func (s *Server) resolveAuthKey() (string, error) {
 				return "", fmt.Errorf("audience for workload identity federation found, but client ID is empty")
 			}
 		}
-		authKey, err = resolveViaWIF(s.shutdownCtx, s.getControlURL(), clientID, idToken, audience, s.AdvertiseTags)
+		authKey, err = resolveViaWIF(s.shutdownCtx, tailscale.ResolveAuthKeyWIFArgs{
+			BaseURL:  s.getControlURL(),
+			ClientID: clientID,
+			IDToken:  idToken,
+			Audience: audience,
+			Tags:     s.AdvertiseTags,
+		})
 		if err != nil {
 			return "", err
 		}
@@ -1262,6 +1320,73 @@ func (s *Server) getUDPHandlerForFlow(src, dst netip.AddrPort) (handler func(net
 // the listening address or use RegisterFallbackTCPHandler.
 func (s *Server) Listen(network, addr string) (net.Listener, error) {
 	return s.listen(network, addr, listenOnTailnet)
+}
+
+// SSHAuthCallback reports whether to accept a new SSH session from a
+// tailscale peer, on listeners from [Server.ListenSSH]. It is an
+// alias for ipnlocal.SSHAuthCallback, the type of
+// [Server.SSHAuthCallback].
+type SSHAuthCallback = ipnlocal.SSHAuthCallback
+
+// ListenSSH listens on the Tailscale network for SSH connections at the given
+// addr (e.g. ":2222"). The returned listener's Accept method yields net.Conn
+// values that are actually *tailssh.Session, providing access to the
+// connecting peer's Tailscale identity, PTY information, signals, and more.
+//
+// # Trust model
+//
+// The server enforces only the tailnet ACL's TCP rules. For any
+// further authorization, the application must use s.SSHAuthCallback, or
+// check each accepted session and close the unwanted ones.
+// SSHAuthCallback enables applications to reject sessions before they
+// are started.
+//
+// Each session is yielded as a net.Conn, with the peer's Tailscale
+// identity available as Session.Peer and Session.UserProfile. The
+// application decides what each session may do, including which local
+// user to run as, if any.
+//
+// # Timeouts and limits
+//
+// The server runs session channels only; it does not forward ports.
+//
+// TS_SSH_LOGIN_GRACE_TIME bounds the time between accepting a
+// connection and completing the handshake. The default is 120
+// seconds, matching sshd's LoginGraceTime.
+//
+// TS_SSH_IDLE_TIMEOUT bounds connections with no SSH traffic. Any
+// traffic on the connection resets the timer. Zero, the default,
+// applies no bound.
+//
+// Sessions accepted by the server wait for Accept in a bounded queue.
+// When the queue is full, the server refuses new sessions, so an
+// application that stops calling Accept parks only a bounded number of
+// sessions.
+//
+// # Basic usage
+//
+// Applications that need only a data stream can use the connections
+// as plain net.Conn (Read, Write, and Close). Applications that need
+// peer identity, PTY configuration, or signals should type-assert to
+// *tailssh.Session. On PTY sessions the server does not translate
+// "\n" to "\r\n", so Read and Write are binary safe.
+//
+// SSH support must be linked into the binary by importing
+// _ "tailscale.com/feature/ssh". Without that import, ListenSSH returns an
+// error.
+//
+// If s has not been started yet, it will be started.
+func (s *Server) ListenSSH(addr string) (net.Listener, error) {
+	rawLn, err := s.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	sshLn, err := s.lb.ListenSSH(rawLn, s.SSHAuthCallback, s.logf)
+	if err != nil {
+		rawLn.Close()
+		return nil, err
+	}
+	return sshLn, nil
 }
 
 // ListenPacket announces on the Tailscale network.
@@ -1612,12 +1737,12 @@ func (ServiceModeHTTP) network() string { return "tcp" }
 
 func (m ServiceModeHTTP) port() uint16 { return m.Port }
 
-func (m ServiceModeHTTP) capsMap() map[string][]tailcfg.PeerCapability {
-	capsMap := map[string][]tailcfg.PeerCapability{}
+func (m ServiceModeHTTP) capsMap() map[string][]peercap.Cap {
+	capsMap := map[string][]peercap.Cap{}
 	for path, capNames := range m.AcceptAppCaps {
-		caps := make([]tailcfg.PeerCapability, 0, len(capNames))
+		caps := make([]peercap.Cap, 0, len(capNames))
 		for _, c := range capNames {
-			caps = append(caps, tailcfg.PeerCapability(c))
+			caps = append(caps, peercap.Cap(c))
 		}
 		capsMap[path] = caps
 	}

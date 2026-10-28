@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"tailscale.com/control/controlknobs"
+	"tailscale.com/envknob"
 	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/health"
 	"tailscale.com/net/dns/resolver"
@@ -33,6 +34,7 @@ import (
 	"tailscale.com/util/eventbus"
 	"tailscale.com/util/slicesx"
 	"tailscale.com/util/syspolicy/policyclient"
+	"tailscale.com/version"
 )
 
 var (
@@ -40,6 +42,17 @@ var (
 	// ErrNoDNSConfig is returned by RecompileDNSConfig when the Manager
 	// has no existing DNS configuration.
 	ErrNoDNSConfig = errors.New("no DNS configuration")
+	// errEmptyBaseConfig is returned by compileConfig when the OS has no
+	// upstream resolvers to forward the default route to. See
+	// https://github.com/tailscale/tailscale/issues/20341
+	errEmptyBaseConfig = errors.New("no upstream resolvers in OS base config")
+)
+
+// Bounds for [Manager.retryEmptyBaseConfig]. The delay doubles each attempt,
+// so these give up after roughly a minute.
+const (
+	baseConfigRetryInterval = 1 * time.Second
+	baseConfigRetryAttempts = 6
 )
 
 // maxActiveQueries returns the maximal number of DNS requests that can
@@ -75,6 +88,7 @@ type Manager struct {
 	mu                  sync.Mutex // guards following
 	config              *Config    // Tracks the last viable DNS configuration set by Set.  nil on failures other than compilation failures or if set has never been called.
 	queryResponseMapper ResponseMapper
+	waitingForBaseCfg   bool // a retry goroutine is waiting for OS upstream resolvers
 }
 
 // NewManager created a new manager from the given config.
@@ -129,6 +143,16 @@ func (m *Manager) Resolver() *resolver.Resolver {
 		return nil
 	}
 	return m.resolver
+}
+
+// ProbeLocks acquires and releases the manager's internal mutexes.
+func (m *Manager) ProbeLocks() {
+	m.mu.Lock()
+	m.mu.Unlock()
+
+	if r := m.Resolver(); r != nil {
+		r.ProbeLocks()
+	}
 }
 
 // RecompileDNSConfig recompiles the last attempted DNS configuration, which has
@@ -205,6 +229,7 @@ func (m *Manager) setLocked(cfg Config) error {
 	}
 
 	m.health.SetHealthy(osConfigurationSetWarnable)
+	m.health.SetHealthy(EmptyBaseConfigWarnable)
 	m.config = &cfg
 
 	return nil
@@ -270,13 +295,27 @@ func compileHostEntries(cfg Config) (hosts []*HostEntry) {
 	return hosts
 }
 
-var osConfigurationReadWarnable = health.Register(&health.Warnable{
+// OSConfigurationReadWarnable is a Warnable set when Tailscale cannot read the
+// DNS configuration the OS was using before Tailscale took over. It is
+// exported so that a test can name it rather than repeat its wording.
+var OSConfigurationReadWarnable = health.Register(&health.Warnable{
 	Code:  "dns-read-os-config-failed",
 	Title: "Failed to read system DNS configuration",
 	Text: func(args health.Args) string {
 		return fmt.Sprintf("Tailscale failed to fetch the DNS configuration of your device: %v", args[health.ArgError])
 	},
 	Severity:  health.SeverityLow,
+	DependsOn: []*health.Warnable{health.NetworkStatusWarnable},
+})
+
+// EmptyBaseConfigWarnable warns that MagicDNS is inactive because the OS has no
+// upstream resolvers to forward the default route to. It is exported so that a
+// test can name it rather than repeat its wording.
+var EmptyBaseConfigWarnable = health.Register(&health.Warnable{
+	Code:      "dns-empty-base-config",
+	Title:     "Waiting for system DNS configuration",
+	Text:      health.StaticMessage("Your device has no system DNS servers for Tailscale to forward queries to, so Tailscale has left DNS alone. MagicDNS stays inactive until the system has DNS servers of its own."),
+	Severity:  health.SeverityMedium,
 	DependsOn: []*health.Warnable{health.NetworkStatusWarnable},
 })
 
@@ -309,8 +348,21 @@ func (m *Manager) compileConfig(cfg Config) (rcfg resolver.Config, ocfg OSConfig
 			routes[suffix] = resolvers
 		}
 	}
+	// LocalDomains is an unordered suffix set, but it comes out of map
+	// iteration; sort it so equal configs compare and log equal.
+	slices.Sort(rcfg.LocalDomains)
 
-	// Similarly, the OS always gets search paths.
+	isWindows := m.goos == "windows"
+	isIOS := m.goos == "ios"
+	isSandboxedMac := m.goos == "darwin" && isSandboxedMacOS()
+	supportsSplitDNS := m.os.SupportsSplitDNS()
+	isSandboxedApple := isIOS || isSandboxedMac
+
+	// Preserve configured search domains in control's order (tailnet first).
+	// Do not add split-DNS suffixes: restricted resolvers are match-only.
+	// LAN-provided search domains are appended below, at lowest priority.
+	// The Apple extension only installs this list in primary resolver mode;
+	// scoped mode uses the match domains as its global search list.
 	ocfg.SearchDomains = cfg.SearchDomains
 	if propagateHostsToOS && m.goos == "windows" {
 		ocfg.Hosts = compileHostEntries(cfg)
@@ -363,16 +415,17 @@ func (m *Manager) compileConfig(cfg Config) (rcfg resolver.Config, ocfg OSConfig
 	// quad-100 will still have the full split configuration as well,
 	// and so can service WSL requests correctly.
 	//
-	// This bool is used in a couple of places below to implement this
-	// workaround.
-	isWindows := m.goos == "windows"
-	isApple := (m.goos == "darwin" || m.goos == "ios")
-	if len(cfg.singleResolverSet()) > 0 && m.os.SupportsSplitDNS() && !isWindows && !isApple {
-		// Split DNS configuration requested, where all split domains
-		// go to the same resolvers. We can let the OS do it.
-		ocfg.Nameservers = toIPsOnly(cfg.singleResolverSet())
-		ocfg.MatchDomains = cfg.matchDomains()
-		return rcfg, ocfg, nil
+	// Apple platforms keep split-domain traffic pointed at quad-100 rather than
+	// handing the upstream resolvers to the OS directly, because those resolvers
+	// may only be reachable through the tunnel.
+	if supportsSplitDNS && !isWindows && !isSandboxedApple {
+		if srs := toIPsOnly(cfg.singleResolverSet()); len(srs) > 0 {
+			// Split DNS configuration requested, where all split domains
+			// go to the same resolvers. We can let the OS do it.
+			ocfg.Nameservers = srs
+			ocfg.MatchDomains = cfg.matchDomains()
+			return rcfg, ocfg, nil
+		}
 	}
 
 	// Split DNS configuration with either multiple upstream routes,
@@ -381,72 +434,202 @@ func (m *Manager) compileConfig(cfg Config) (rcfg resolver.Config, ocfg OSConfig
 	rcfg.Routes = routes
 	ocfg.Nameservers = cfg.serviceIPs(m.knobs)
 
-	var baseCfg *OSConfig // base config; non-nil if/when known
+	// Apple tunnels can contribute global search domains only through
+	// matchDomains with matchDomainsNoSearch=false; NEDNSSettings.searchDomains
+	// is stripped by configd. Scope only simple configs (Mode A), otherwise
+	// install quad-100 as primary (Mode B) and keep split suffixes internal.
+	// This prevents custom split suffixes from becoming search domains while
+	// keeping bare tailnet names reachable. See tailscale/corp#48693.
+	//
+	// Both forward records and the PTR records synthesized from Hosts must
+	// be covered. Scoping is opt-out on iOS and opt-in on sandboxed macOS.
+	appleScopeEnabled := (isIOS && !m.disableSplitDNSOptimization()) ||
+		(isSandboxedMac && m.scopeQuad100OnMacOS())
+	scopeApple := appleScopeEnabled && rcfg.RoutesRequireNoCustomResolvers() &&
+		!cfg.requiresPrimaryResolver() && !cfg.hasHostsWithoutReverseRoutes()
 
-	// Even though Apple devices can do split DNS, they don't provide a way to
-	// selectively answer ExtraRecords, and ignore other DNS traffic. As a
-	// workaround, we read the existing default resolver configuration and use
-	// that as the forwarder for all DNS traffic that quad-100 doesn't handle.
-	if isApple || !m.os.SupportsSplitDNS() {
-		// If the OS can't do native split-dns, read out the underlying
-		// resolver config and blend it into our config.  On apple platforms, [OSConfigurator.GetBaseConfig]
-		// has a tendency to temporarily fail if called immediately following
-		// an interface change.  These failures should be retried if/when the OS
-		// indicates that the DNS configuration has changed via [RecompileDNSConfig].
-		cfg, err := m.os.GetBaseConfig()
-		if err == nil {
-			baseCfg = &cfg
-		} else if (isApple || isNoopManager(m.os)) && err == ErrGetBaseConfigNotSupported {
-			// Expected when using noopManager (userspace networking) or on
-			// certain iOS/macOS builds. Continue without base config.
-		} else {
-			m.health.SetUnhealthy(osConfigurationReadWarnable, health.Args{health.ArgError: err.Error()})
-			return resolver.Config{}, OSConfig{}, err
-		}
-		m.health.SetHealthy(osConfigurationReadWarnable)
+	// iOS still reads the base config below, even when scoped, so direct
+	// queries to quad-100 can be forwarded to the underlying resolver.
+	if supportsSplitDNS && !isIOS && (!isSandboxedApple || scopeApple) {
+		ocfg.MatchDomains = cfg.matchDomains()
+		return rcfg, ocfg, nil
 	}
 
-	if baseCfg == nil {
-		// If there was no base config, then we need to fallback to SplitDNS mode.
+	// When quad-100 is primary (or the OS cannot do split DNS), use the
+	// underlying resolver for queries quad-100 cannot answer locally. On iOS,
+	// [OSConfigurator.GetBaseConfig] can temporarily fail immediately after an
+	// interface change. These failures should be retried if/when the OS indicates
+	// that the DNS configuration has changed via [RecompileDNSConfig].
+	base, err := m.os.GetBaseConfig()
+	if err != nil {
+		if errors.Is(err, ErrGetBaseConfigNoResolvers) {
+			m.health.SetHealthy(OSConfigurationReadWarnable)
+			m.health.SetUnhealthy(EmptyBaseConfigWarnable, nil)
+			if !isSandboxedApple {
+				m.retryEmptyBaseConfig()
+			}
+			return resolver.Config{}, OSConfig{}, err
+		}
+		canScopeWithoutBase := !isSandboxedApple && (isNoopManager(m.os) || supportsSplitDNS) ||
+			isIOS && supportsSplitDNS && scopeApple
+		if canScopeWithoutBase && err == ErrGetBaseConfigNotSupported {
+			// Some managers have no base config by construction. Apple Mode B
+			// cannot fall back to scoping: it would lose unrouted records or
+			// expose split suffixes as search domains. Nor can it install a
+			// catch-all without forwarding upstreams; report the read error.
+			// Sandboxed macOS has /etc/resolv.conf, so an unsupported read
+			// remains an error there, even for an otherwise simple config.
+			m.health.SetHealthy(OSConfigurationReadWarnable)
+			ocfg.MatchDomains = cfg.matchDomains()
+			return rcfg, ocfg, nil
+		}
+		m.health.SetUnhealthy(OSConfigurationReadWarnable, health.Args{health.ArgError: err.Error()})
+		return resolver.Config{}, OSConfig{}, err
+	}
+	m.health.SetHealthy(OSConfigurationReadWarnable)
+
+	defaultRoutes := underlyingResolvers(base)
+	if len(defaultRoutes) == 0 && (!isSandboxedApple || !scopeApple) {
+		// Taking over here would point the OS at quad-100 with an empty "."
+		// route, failing every non-Tailscale name. Leave the OS config alone
+		// and retry until resolvers appear. Check the recovered resolvers,
+		// which may carry endpoints not representable in base.Nameservers.
+		// Apple extensions trigger recompilation on DNS changes instead of
+		// using the retry goroutine. Apple scoped mode does not need upstreams
+		// for queries left to the OS, so it tolerates a successful empty read.
+		m.logf("no upstream resolvers in OS base config; not taking over DNS")
+		m.health.SetUnhealthy(EmptyBaseConfigWarnable, nil)
+		if !isSandboxedApple {
+			m.retryEmptyBaseConfig()
+		}
+		return resolver.Config{}, OSConfig{}, errEmptyBaseConfig
+	} else if len(defaultRoutes) == 0 {
+		m.logf("dns: base config has no resolvers; quad-100 has no upstream for non-tailnet queries")
+	}
+
+	if isIOS && supportsSplitDNS && scopeApple {
+		// Include the authoritative MagicDNS roots, not just upstream routes.
+		// Do not union search-only domains: that would capture their queries.
 		ocfg.MatchDomains = cfg.matchDomains()
-	} else {
-		// On iOS only (for now), check if all route names point to resources inside the tailnet.
-		// If so, we can set those names as MatchDomains to enable a split DNS configuration
-		// which will help preserve battery life.
-		// Because on iOS MatchDomains must equal SearchDomains, we cannot do this when
-		// we have any Routes outside the tailnet. Otherwise when app connectors are enabled,
-		// a query for 'work-laptop' might lead to search domain expansion, resolving
-		// as 'work-laptop.aws.com' for example.
-		if m.goos == "ios" && rcfg.RoutesRequireNoCustomResolvers() {
-			if !m.disableSplitDNSOptimization() {
-				for r := range rcfg.Routes {
-					ocfg.MatchDomains = append(ocfg.MatchDomains, r)
-				}
-			} else {
-				m.logf("iOS split DNS is disabled by nodeattr")
-			}
-		}
-		var defaultRoutes []*dnstype.Resolver
-		for _, ip := range baseCfg.Nameservers {
-			defaultRoutes = append(defaultRoutes, &dnstype.Resolver{Addr: ip.String()})
-		}
-		rcfg.Routes["."] = defaultRoutes
-		// Append base config search domains, but only if not already present.
-		// This prevents duplicates when GetBaseConfig() reads back domains that
-		// Tailscale itself previously wrote to resolv.conf.
-		for _, domain := range baseCfg.SearchDomains {
-			if !slices.Contains(ocfg.SearchDomains, domain) {
-				ocfg.SearchDomains = append(ocfg.SearchDomains, domain)
-			}
+	}
+	rcfg.Routes["."] = defaultRoutes
+	// Append base config search domains, but only if not already present.
+	// This prevents duplicates when GetBaseConfig() reads back domains that
+	// Tailscale itself previously wrote to resolv.conf.
+	for _, domain := range base.SearchDomains {
+		if !slices.Contains(ocfg.SearchDomains, domain) {
+			ocfg.SearchDomains = append(ocfg.SearchDomains, domain)
 		}
 	}
 
 	return rcfg, ocfg, nil
 }
 
+// underlyingResolvers returns the resolvers that quad-100 should forward
+// non-tailnet queries to, derived from the OS's base configuration.
+//
+// Platforms that can recover the underlying configuration with more detail
+// than IP addresses (non-standard ports, DoH/DoT endpoints) populate
+// [OSConfig.Resolvers], which preserves that detail end to end. Otherwise we
+// fall back to plain IP:53 resolvers built from Nameservers. Note that the
+// result can be empty: callers that cannot serve queries without a catch-all
+// forwarder must check and handle that case.
+func underlyingResolvers(base OSConfig) []*dnstype.Resolver {
+	if len(base.Resolvers) > 0 {
+		out := make([]*dnstype.Resolver, 0, len(base.Resolvers))
+		for _, r := range base.Resolvers {
+			if r == nil || r.Addr == "" {
+				continue
+			}
+			out = append(out, r.Clone())
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+	var out []*dnstype.Resolver
+	for _, ip := range base.Nameservers {
+		out = append(out, &dnstype.Resolver{Addr: ip.String()})
+	}
+	return out
+}
+
 func (m *Manager) disableSplitDNSOptimization() bool {
 	return m.knobs != nil && m.knobs.DisableSplitDNSWhenNoCustomResolvers.Load()
 }
+
+var scopeQuad100OnMacOSEnv = envknob.RegisterOptBool("TS_DEBUG_SCOPE_QUAD100_MACOS")
+
+// scopeQuad100OnMacOS reports whether sandboxed macOS should scope quad-100 to
+// its match domains for eligible simple configs, rather than installing it
+// as the OS's primary resolver. Off (false) unless control sets
+// NodeAttrScopeQuad100OnMacOS, or TS_DEBUG_SCOPE_QUAD100_MACOS is set.
+// See tailscale/corp#45534.
+func (m *Manager) scopeQuad100OnMacOS() bool {
+	if v, ok := scopeQuad100OnMacOSEnv().Get(); ok {
+		return v
+	}
+	return m.knobs != nil && m.knobs.ScopeQuad100OnMacOS.Load()
+}
+
+// retryEmptyBaseConfig starts a goroutine that reapplies the last config until
+// the OS has upstream resolvers, giving up after baseConfigRetryAttempts. A
+// later [Manager.Set] or link change starts it again.
+//
+// Only one runs at a time: each attempt re-enters compileConfig, which calls
+// back here while the base config is still empty.
+//
+// m.mu must be held.
+func (m *Manager) retryEmptyBaseConfig() {
+	syncs.AssertLocked(&m.mu)
+	if m.waitingForBaseCfg {
+		return
+	}
+	m.waitingForBaseCfg = true
+	go func() {
+		defer func() {
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			m.waitingForBaseCfg = false
+		}()
+		d := baseConfigRetryInterval
+		for range baseConfigRetryAttempts {
+			select {
+			case <-m.ctx.Done():
+				return
+			case <-time.After(d):
+			}
+			d *= 2
+			switch err := m.reapplyConfig(); {
+			case err == nil:
+				m.logf("OS upstream resolvers appeared; DNS configured")
+				return
+			case errors.Is(err, errEmptyBaseConfig):
+				// Keep waiting.
+			case errors.Is(err, net.ErrClosed):
+				return
+			default:
+				// Could be transient, e.g. a failed OS config read, so keep
+				// waiting rather than giving up early.
+				m.logf("error reapplying DNS config: %v", err)
+			}
+		}
+		m.logf("gave up waiting for OS upstream resolvers")
+	}()
+}
+
+// reapplyConfig reapplies the last config, returning [net.ErrClosed] if
+// [Manager.Down] has run or there is no config to apply.
+func (m *Manager) reapplyConfig() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.ctx.Err() != nil || m.config == nil {
+		return net.ErrClosed
+	}
+	return m.setLocked(*m.config)
+}
+
+var isSandboxedMacOS = version.IsSandboxedMacOS
 
 // toIPsOnly returns only the IP portion of dnstype.Resolver.
 // Only safe to use if the resolvers slice has been cleared of
@@ -504,7 +687,7 @@ const (
 	maxReqSizeTCP = 4096
 )
 
-// TrampleDNS is an an event indicating we detected that DNS config was
+// TrampleDNS is an event indicating we detected that DNS config was
 // overwritten by another process.
 type TrampleDNS struct {
 	LastTrample       time.Time

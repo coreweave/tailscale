@@ -61,6 +61,14 @@ type Config struct {
 	// OnlyIPv6, if true, uses the IPv6 service IP (for MagicDNS)
 	// instead of the IPv4 version (100.100.100.100).
 	OnlyIPv6 bool
+	// MagicDNSHostsUnrouted is whether MagicDNS host records are
+	// served on demand via [resolver.MagicDNSHosts] (so are not
+	// listed in Hosts) without being covered by any Routes entry;
+	// that is, MagicDNS domain routing is off. It preserves the
+	// effect the node records had when they were listed in Hosts:
+	// hasHostsWithoutSplitDNSRoutes reports true, keeping quad-100
+	// in the OS resolver path so the names still resolve.
+	MagicDNSHostsUnrouted bool
 }
 
 var magicDNSDualStack = envknob.RegisterBool("TS_DEBUG_MAGIC_DNS_DUAL_STACK")
@@ -127,14 +135,32 @@ func (c Config) hasDefaultIPResolversOnly() bool {
 // hasHostsWithoutSplitDNSRoutes reports whether c contains any Host entries
 // that aren't covered by a SplitDNS route suffix.
 func (c Config) hasHostsWithoutSplitDNSRoutes() bool {
-	// TODO(bradfitz): this could be more efficient, but we imagine
-	// the number of SplitDNS routes and/or hosts will be small.
+	if c.MagicDNSHostsUnrouted {
+		return true
+	}
+	// Hosts is small here on most platforms: per-node records are
+	// served via [resolver.MagicDNSHosts] (accounted for above), so
+	// only control's DNS.ExtraRecords remain. On Windows it still
+	// carries every node's records for the hosts-file path.
 	for host := range c.Hosts {
 		if !c.hasSplitDNSRouteForHost(host) {
 			return true
 		}
 	}
 	return false
+}
+
+// requiresPrimaryResolver reports whether c can only be served correctly with
+// quad-100 installed as the OS's primary (catch-all) resolver, rather than
+// scoped to a set of match domains.
+//
+// That's the case when c has names quad-100 must answer that no route suffix
+// covers, so there is no suffix to scope to. dnsConfigForNetmap pairs every
+// ExtraRecord it emits with a route, so in practice this is the
+// MagicDNS-names-present but MagicDNS-domain-routing-off case
+// (MagicDNSHostsUnrouted).
+func (c Config) requiresPrimaryResolver() bool {
+	return c.hasHostsWithoutSplitDNSRoutes()
 }
 
 // hasSplitDNSRouteForHost reports whether c contains a SplitDNS route
@@ -146,6 +172,35 @@ func (c Config) hasSplitDNSRouteForHost(host dnsname.FQDN) bool {
 		}
 	}
 	return false
+}
+
+// hasHostsWithoutReverseRoutes reports whether any PTR record synthesized by
+// quad-100 from Hosts is outside the configured routes. Apple scoping must
+// preserve these answers as well as forward records.
+func (c Config) hasHostsWithoutReverseRoutes() bool {
+	for _, ips := range c.Hosts {
+		for _, ip := range ips {
+			if !ip.IsValid() || !c.hasSplitDNSRouteForHost(reverseDNSName(ip)) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// reverseDNSName returns the PTR query name for a valid IP address.
+func reverseDNSName(ip netip.Addr) dnsname.FQDN {
+	if ip.Is4() {
+		b := ip.As4()
+		return dnsname.FQDN(fmt.Sprintf("%d.%d.%d.%d.in-addr.arpa.", b[3], b[2], b[1], b[0]))
+	}
+	b := ip.As16()
+	const hex = "0123456789abcdef"
+	name := make([]byte, 0, 64+len("ip6.arpa."))
+	for i := len(b) - 1; i >= 0; i-- {
+		name = append(name, hex[b[i]&0xf], '.', hex[b[i]>>4], '.')
+	}
+	return dnsname.FQDN(append(name, "ip6.arpa."...))
 }
 
 func (c Config) hasDefaultResolvers() bool {

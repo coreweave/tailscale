@@ -11,6 +11,7 @@
 package main // import "tailscale.com/cmd/derper"
 
 import (
+	"bufio"
 	"cmp"
 	"context"
 	"crypto/tls"
@@ -31,9 +32,9 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
-	runtimemetrics "runtime/metrics"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -62,10 +63,11 @@ var (
 	configPath  = flag.String("c", "", "config file path")
 	certMode    = flag.String("certmode", "letsencrypt", "mode for getting a cert. possible options: manual, letsencrypt, gcp")
 	certDir     = flag.String("certdir", tsweb.DefaultCertDir("derper-certs"), "directory to store ACME (e.g. LetsEncrypt) certs, if addr's port is :443")
-	hostname    = flag.String("hostname", "derp.tailscale.com", "TLS host name for certs, if addr's port is :443. When --certmode=manual, this can be an IP address to avoid SNI checks")
+	hostname    = flag.String("hostname", "derp.tailscale.com", "TLS host name for certs, if addr's port is :443. It can be an IP address when --certmode=manual (to avoid SNI checks) or when --acme-ip-certs is set (to run an IP-only server with no hostname cert)")
 	acmeEABKid  = flag.String("acme-eab-kid", "", "ACME External Account Binding (EAB) Key ID (required for --certmode=gcp)")
 	acmeEABKey  = flag.String("acme-eab-key", "", "ACME External Account Binding (EAB) HMAC key, base64-encoded (required for --certmode=gcp)")
 	acmeEmail   = flag.String("acme-email", "", "ACME account contact email address (required for --certmode=gcp, optional for letsencrypt)")
+	acmeIPCerts = flag.Bool("acme-ip-certs", false, "whether to serve LetsEncrypt certs for the server's IP addresses: when a client connects by IP address (sending no TLS SNI, or an IP address SNI matching the connection's destination IP), get and serve a LetsEncrypt cert for that IP, using the short-lived (~6 day) ACME certificate profile. This works for both IPv4 and IPv6 with no per-address configuration. It requires --certmode=letsencrypt and the ACME server must be able to reach port 80 at each such IP for the HTTP-01 challenge.")
 	runSTUN     = flag.Bool("stun", true, "whether to run a STUN server. It will bind to the same IP (if any) as the --addr flag value.")
 	runDERP     = flag.Bool("derp", true, "whether to run a DERP server. The only reason to set this false is if you're decommissioning a server but want to keep its bootstrap DNS functionality still running.")
 	flagHome    = flag.String("home", "", "what to serve at the root path. It may be left empty (the default, for a default homepage), \"blank\" for a blank page, or a URL to redirect to")
@@ -78,9 +80,10 @@ var (
 	bootstrapDNS    = flag.String("bootstrap-dns-names", "", "optional comma-separated list of hostnames to make available at /bootstrap-dns")
 	unpublishedDNS  = flag.String("unpublished-bootstrap-dns-names", "", "optional comma-separated list of hostnames to make available at /bootstrap-dns and not publish in the list. If an entry contains a slash, the second part names a DNS record to poll for its TXT record with a `0` to `100` value for rollout percentage.")
 
-	verifyClients   = flag.Bool("verify-clients", false, "verify clients to this DERP server through a local tailscaled instance.")
-	verifyClientURL = flag.String("verify-client-url", "", "if non-empty, an admission controller URL for permitting client connections; see tailcfg.DERPAdmitClientRequest")
-	verifyFailOpen  = flag.Bool("verify-client-url-fail-open", true, "whether we fail open if --verify-client-url is unreachable")
+	verifyClients    = flag.Bool("verify-clients", false, "verify clients to this DERP server through a local tailscaled instance.")
+	verifyClientURL  = flag.String("verify-client-url", "", "if non-empty, an admission controller URL for permitting client connections; see tailcfg.DERPAdmitClientRequest")
+	verifyFailOpen   = flag.Bool("verify-client-url-fail-open", true, "whether we fail open if --verify-client-url is unreachable")
+	disallowAppNames = flag.String("disallow-app-names", "", "optional comma-separated list of client-advertised app names to refuse connections from. Trusted mesh peers are exempt.")
 
 	socket = flag.String("socket", "", "optional alternate path to tailscaled socket (only relevant when using --verify-clients)")
 
@@ -193,6 +196,9 @@ func main() {
 	s.SetTailscaledSocketPath(*socket)
 	s.SetVerifyClientURL(*verifyClientURL)
 	s.SetVerifyClientURLFailOpen(*verifyFailOpen)
+	if *disallowAppNames != "" {
+		s.SetDisallowedAppNames(strings.Split(*disallowAppNames, ","))
+	}
 	s.SetTCPWriteTimeout(*tcpWriteTimeout)
 	if *rateConfigPath != "" {
 		if err := s.LoadAndApplyRateConfig(*rateConfigPath); err != nil {
@@ -262,7 +268,7 @@ func main() {
 	mux := http.NewServeMux()
 	if *runDERP {
 		derpHandler := derpserver.Handler(s)
-		derpHandler = addWebSocketSupport(s, derpHandler)
+		derpHandler = derpserver.AddWebSocketSupport(s, derpHandler)
 		mux.Handle("/derp", derpHandler)
 	} else {
 		mux.Handle("/derp", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -298,6 +304,7 @@ func main() {
 		}
 	}))
 	debug.Handle("traffic", "Traffic check", http.HandlerFunc(s.ServeDebugTraffic))
+	debug.Handle("clients/", "Connected clients", http.HandlerFunc(s.ServeDebugClients))
 	debug.Handle("set-mutex-profile-fraction", "SetMutexProfileFraction", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s := r.FormValue("rate")
 		if s == "" || r.Header.Get("Sec-Debug") != "derp" {
@@ -349,20 +356,12 @@ func main() {
 	if serveTLS {
 		log.Printf("derper: serving on %s with TLS", *addr)
 		var certManager certProvider
-		certManager, err = certProviderByCertMode(*certMode, *certDir, *hostname, *acmeEABKid, *acmeEABKey, *acmeEmail)
+		certManager, err = certProviderByCertMode(*certMode, *certDir, *hostname, *acmeIPCerts, *acmeEABKid, *acmeEABKey, *acmeEmail)
 		if err != nil {
 			log.Fatalf("derper: can not start cert provider: %v", err)
 		}
 		httpsrv.TLSConfig = certManager.TLSConfig()
-		getCert := httpsrv.TLSConfig.GetCertificate
-		httpsrv.TLSConfig.GetCertificate = func(hi *tls.ClientHelloInfo) (*tls.Certificate, error) {
-			cert, err := getCert(hi)
-			if err != nil {
-				return nil, err
-			}
-			cert.Certificate = append(cert.Certificate, s.MetaCert())
-			return cert, nil
-		}
+		s.ModifyTLSConfigToAddMetaCert(httpsrv.TLSConfig)
 		// Disable TLS 1.0 and 1.1, which are obsolete and have security issues.
 		httpsrv.TLSConfig.MinVersion = tls.VersionTLS12
 		httpsrv.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -380,7 +379,21 @@ func main() {
 				}
 				tlsRequestVersion.Add(label, 1)
 				tlsActiveVersion.Add(label, 1)
-				defer tlsActiveVersion.Add(label, -1)
+				// Handlers that hijack the connection (DERP, its
+				// WebSocket flavor, CONNECT) return before the
+				// connection is done, so the active gauge must be
+				// held until the hijacked connection closes rather
+				// than until the handler returns.
+				htw := &hijackTrackingResponseWriter{
+					ResponseWriter: w,
+					onConnClose:    func() { tlsActiveVersion.Add(label, -1) },
+				}
+				w = htw
+				defer func() {
+					if !htw.hijacked {
+						tlsActiveVersion.Add(label, -1)
+					}
+				}()
 
 				if r.Method == "CONNECT" {
 					serveConnect(s, w, r)
@@ -537,19 +550,6 @@ func (ln *rateLimitedListener) Accept() (net.Conn, error) {
 	return cn, nil
 }
 
-func init() {
-	expvar.Publish("go_sync_mutex_wait_seconds", expvar.Func(func() any {
-		const name = "/sync/mutex/wait/total:seconds" // Go 1.20+
-		var s [1]runtimemetrics.Sample
-		s[0].Name = name
-		runtimemetrics.Read(s[:])
-		if v := s[0].Value; v.Kind() == runtimemetrics.KindFloat64 {
-			return v.Float64()
-		}
-		return 0
-	}))
-}
-
 type templateData struct {
 	ShowAbuseInfo bool
 	Disabled      bool
@@ -630,3 +630,58 @@ func getHomeHandler(val string) (_ http.Handler, ok bool) {
 	}
 	return nil, false
 }
+
+// hijackTrackingResponseWriter wraps an http.ResponseWriter and watches
+// for the handler hijacking the connection, in which case it arranges
+// for onConnClose to run once when the hijacked connection is closed.
+// It exists so the TLS active-connection gauge tracks the lifetime of
+// hijacked connections (DERP and CONNECT), whose handlers return well
+// before the connection is done.
+type hijackTrackingResponseWriter struct {
+	http.ResponseWriter
+	onConnClose func()
+
+	// hijacked reports whether Hijack was called successfully. It is
+	// only used from the handler's goroutine, so it needs no locking.
+	hijacked bool
+}
+
+// Unwrap supports http.ResponseController.
+func (w *hijackTrackingResponseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+func (w *hijackTrackingResponseWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (w *hijackTrackingResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hj, ok := w.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, errors.New("underlying ResponseWriter does not support hijacking")
+	}
+	c, brw, err := hj.Hijack()
+	if err != nil {
+		return c, brw, err
+	}
+	w.hijacked = true
+	return &closeHookConn{Conn: c, onClose: w.onConnClose}, brw, nil
+}
+
+// closeHookConn is a net.Conn wrapper that runs onClose once when the
+// connection is closed.
+type closeHookConn struct {
+	net.Conn
+	onClose   func()
+	closeOnce sync.Once
+}
+
+func (c *closeHookConn) Close() error {
+	c.closeOnce.Do(c.onClose)
+	return c.Conn.Close()
+}
+
+// NetConn returns the underlying connection, letting code that walks
+// connection wrappers (such as derpserver's TCP RTT stats) reach the
+// *net.TCPConn below.
+func (c *closeHookConn) NetConn() net.Conn { return c.Conn }

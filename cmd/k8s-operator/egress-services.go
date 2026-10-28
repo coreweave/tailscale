@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"net/netip"
 	"reflect"
 	"slices"
 	"strings"
@@ -190,7 +191,25 @@ func (esr *egressSvcsReconciler) maybeProvision(ctx context.Context, svc *corev1
 	if clusterIPSvc == nil {
 		clusterIPSvc = esr.clusterIPSvcForEgress(crl)
 	}
+	// Detect which IP families the ClusterIP Service supports to determine which
+	// EndpointSlices must exist.
+	addrTypes, err := addrTypesForClusterIPSvc(clusterIPSvc)
+	if err != nil {
+		return err
+	}
 	upToDate := svcConfigurationUpToDate(svc, lg)
+	if upToDate && clusterIPSvc.Name != "" {
+		// The configuration can still match while an expected-family EndpointSlice
+		// is missing - check expected EndpointSlices exist.
+		missing, err := esr.missingEndpointSliceFamilies(ctx, clusterIPSvc, addrTypes)
+		if err != nil {
+			return err
+		}
+		if missing {
+			lg.Info("an expected EndpointSlice is missing, reprovisioning")
+			upToDate = false
+		}
+	}
 	provisioned := true
 	if !upToDate {
 		if clusterIPSvc, provisioned, err = esr.provision(ctx, svc.Annotations[AnnotationProxyGroup], svc, clusterIPSvc, lg); err != nil {
@@ -216,6 +235,26 @@ func (esr *egressSvcsReconciler) maybeProvision(ctx context.Context, svc *corev1
 	r = svcConfiguredReason(svc, true, lg)
 	st = metav1.ConditionTrue
 	return nil
+}
+
+// addrTypesForClusterIPSvc returns the EndpointSlice address types (IP families)
+// that the given ClusterIP Service supports, derived from its ClusterIPs.
+// TODO(beckypauley): this could read Spec.IPFamilies directly instead of parsing
+// ClusterIPs to determine the family.
+func addrTypesForClusterIPSvc(clusterIPSvc *corev1.Service) ([]discoveryv1.AddressType, error) {
+	addrTypes := make([]discoveryv1.AddressType, 0, len(clusterIPSvc.Spec.ClusterIPs))
+	for _, clusterIP := range clusterIPSvc.Spec.ClusterIPs {
+		ip, err := netip.ParseAddr(clusterIP)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing ClusterIP %q: %w", clusterIP, err)
+		}
+		addrType := discoveryv1.AddressTypeIPv4
+		if ip.Is6() {
+			addrType = discoveryv1.AddressTypeIPv6
+		}
+		addrTypes = append(addrTypes, addrType)
+	}
+	return addrTypes, nil
 }
 
 func (esr *egressSvcsReconciler) provision(ctx context.Context, proxyGroupName string, svc, clusterIPSvc *corev1.Service, lg *zap.SugaredLogger) (*corev1.Service, bool, error) {
@@ -315,28 +354,28 @@ func (esr *egressSvcsReconciler) provision(ctx context.Context, proxyGroupName s
 			return nil, false, fmt.Errorf("error ensuring ClusterIP Service: %v", err)
 		}
 	}
-
 	crl := egressSvcEpsLabels(svc, clusterIPSvc)
-	// TODO(irbekrm): support IPv6, but need to investigate how kube proxy
-	// sets up Service -> Pod routing when IPv6 is involved.
-	eps := &discoveryv1.EndpointSlice{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%s-ipv4", clusterIPSvc.Name),
-			Namespace: esr.tsNamespace,
-			Labels:    crl,
-		},
-		AddressType: discoveryv1.AddressTypeIPv4,
-		Ports:       epsPortsFromSvc(clusterIPSvc),
+	addrTypes, err := addrTypesForClusterIPSvc(clusterIPSvc)
+	if err != nil {
+		return nil, false, err
 	}
-	if eps, err = createOrUpdate(ctx, esr.Client, esr.tsNamespace, eps, func(e *discoveryv1.EndpointSlice) {
-		e.Labels = eps.Labels
-		e.AddressType = eps.AddressType
-		e.Ports = eps.Ports
-		for _, p := range e.Endpoints {
-			p.Conditions.Ready = nil
+	for _, addrType := range addrTypes {
+		eps := &discoveryv1.EndpointSlice{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      fmt.Sprintf("%s-%s", clusterIPSvc.Name, strings.ToLower(string(addrType))),
+				Namespace: esr.tsNamespace,
+				Labels:    crl,
+			},
+			AddressType: addrType,
+			Ports:       epsPortsFromSvc(clusterIPSvc),
 		}
-	}); err != nil {
-		return nil, false, fmt.Errorf("error ensuring EndpointSlice: %w", err)
+		if _, err := createOrUpdate(ctx, esr.Client, esr.tsNamespace, eps, func(e *discoveryv1.EndpointSlice) {
+			e.Labels = eps.Labels
+			e.AddressType = eps.AddressType
+			e.Ports = eps.Ports
+		}); err != nil {
+			return nil, false, fmt.Errorf("error ensuring %s EndpointSlice: %w", addrType, err)
+		}
 	}
 
 	cm, cfgs, err := egressSvcsConfigs(ctx, esr.Client, proxyGroupName, esr.tsNamespace)
@@ -760,6 +799,23 @@ func svcConfiguredReason(svc *corev1.Service, configured bool, lg *zap.SugaredLo
 // service from other tailnet services exposed to cluster workloads.
 func tailnetSvcName(extNSvc *corev1.Service) string {
 	return fmt.Sprintf("%s-%s", extNSvc.Namespace, extNSvc.Name)
+}
+
+// missingEndpointSliceFamilies reports whether any EndpointSlice expected for the given ClusterIP Service (one per addrType)
+// does not exist. Slices are looked up by name rather than labels so an orphaned EndpointSlice cannot satisfy the check.
+func (esr *egressSvcsReconciler) missingEndpointSliceFamilies(ctx context.Context, clusterIPSvc *corev1.Service, addrTypes []discoveryv1.AddressType) (bool, error) {
+	for _, addrType := range addrTypes {
+		eps := &discoveryv1.EndpointSlice{}
+		name := fmt.Sprintf("%s-%s", clusterIPSvc.Name, strings.ToLower(string(addrType)))
+		err := esr.Get(ctx, types.NamespacedName{Namespace: esr.tsNamespace, Name: name}, eps)
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("error retrieving %s EndpointSlice: %w", addrType, err)
+		}
+	}
+	return false, nil
 }
 
 // epsPortsFromSvc takes the ClusterIP Service created for an egress service and

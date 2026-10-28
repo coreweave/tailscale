@@ -36,6 +36,9 @@ import (
 )
 
 func init() {
+	if !feature.Register("clientupdate") {
+		return
+	}
 	ipnext.RegisterExtension("clientupdate", newExt)
 
 	// C2N
@@ -179,6 +182,10 @@ func (e *extension) DoSelfUpdate() {
 // serveUpdateProgress after pinging this endpoint to check how the update is
 // going.
 func serveUpdateInstall(h *localapi.Handler, w http.ResponseWriter, r *http.Request) {
+	if !h.PermitWrite {
+		http.Error(w, "update access denied", http.StatusForbidden)
+		return
+	}
 	if r.Method != httpm.POST {
 		http.Error(w, "only POST allowed", http.StatusMethodNotAllowed)
 		return

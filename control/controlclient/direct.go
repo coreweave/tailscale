@@ -43,27 +43,31 @@ import (
 	"tailscale.com/net/dnscache"
 	"tailscale.com/net/dnsfallback"
 	"tailscale.com/net/netmon"
+	"tailscale.com/net/netutil"
 	"tailscale.com/net/netx"
 	"tailscale.com/net/tlsdial"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/tka"
 	"tailscale.com/tstime"
-	"tailscale.com/types/events"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/persist"
 	"tailscale.com/types/tkatype"
+	"tailscale.com/types/views"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/eventbus"
+	"tailscale.com/util/httpbody"
 	"tailscale.com/util/singleflight"
 	"tailscale.com/util/syspolicy/pkey"
 	"tailscale.com/util/syspolicy/policyclient"
 	"tailscale.com/util/testenv"
 	"tailscale.com/util/vizerror"
 	"tailscale.com/util/zstdframe"
+	"tailscale.com/wgengine/filter"
 )
 
 // Direct is the client that connects to a tailcontrol server for a node.
@@ -112,9 +116,8 @@ type Direct struct {
 	netinfo                 *tailcfg.NetInfo
 	endpoints               []tailcfg.Endpoint
 	tkaHead                 string
-	lastPingURL             string      // last PingRequest.URL received, for dup suppression
-	connectionHandleForTest string      // sent in MapRequest.ConnectionHandleForTest
-	streamingMapSession     *mapSession // the one streaming mapSession instance
+	lastPingURL             string // last PingRequest.URL received, for dup suppression
+	connectionHandleForTest string // sent in MapRequest.ConnectionHandleForTest
 
 	controlClientID int64 // Random ID used to differentiate clients for consumers of messages.
 }
@@ -226,6 +229,9 @@ type NetmapUpdater interface {
 // rather than just full updates.
 type NetmapDeltaUpdater interface {
 	// UpdateNetmapDelta is called with discrete changes to the network map.
+	// The mutation slice may contain [netmap.NodeMutationUpsert] entries when
+	// peers are inserted or replaced, and [netmap.NodeMutationRemove] entries
+	// when peers are removed, alongside per-field patches.
 	//
 	// The ok result is whether the implementation was able to apply the
 	// mutations. It might return false if its internal state doesn't
@@ -234,13 +240,50 @@ type NetmapDeltaUpdater interface {
 	UpdateNetmapDelta([]netmap.NodeMutation) (ok bool)
 }
 
-// patchDiscoKeyer is an optional interface that can be implemented by an [Observer] to be
-// notified about node disco keys received out-of-band from control, via
-// existing connection state.
-type patchDiscoKeyer interface {
-	// PatchDiscoKey reports to the receiver that the specified disco key
-	// for node was obtained out-of-band from control.
-	PatchDiscoKey(key.NodePublic, key.DiscoPublic)
+// PacketFilterUpdater is an optional interface that can be implemented by
+// NetmapUpdater implementations to receive incremental packet-filter updates
+// without a full netmap rebuild.
+//
+// It exists because the packet filter currently changes on every peer
+// addition, so a MapResponse carrying PeersChanged almost always also carries
+// PacketFilter (or PacketFilters). Handling the filter narrowly keeps peer
+// churn O(1) on the controlclient side.
+type PacketFilterUpdater interface {
+	// UpdatePacketFilter is called when a MapResponse's PacketFilter (or
+	// PacketFilters) changed. rules is the already-merged concatenation of
+	// the session's named packet filter chunks; parsed is the parsed form.
+	//
+	// It returns false to signal the caller to fall back to a full
+	// netmap rebuild. Proxy/forwarder implementations return false when
+	// their downstream destination doesn't implement
+	// [PacketFilterUpdater]; concrete implementations return true on
+	// successful apply.
+	UpdatePacketFilter(rules views.Slice[tailcfg.FilterRule], parsed []filter.Match) bool
+}
+
+// UserProfileUpdater is an optional interface that can be implemented by
+// NetmapUpdater implementations to receive incremental UserProfile updates
+// without a full netmap rebuild.
+//
+// It exists so consumers of [ipn.Notify.UserProfiles] can be told about
+// new or updated UserProfiles before (or with) the [ipn.Notify.PeersChanged]
+// or [ipn.Notify.PeerChangedPatch] entry that references the corresponding
+// UserID.
+type UserProfileUpdater interface {
+	// UpdateUserProfiles is called when a MapResponse carries UserProfiles
+	// entries. profiles is the new/updated subset (NOT the full map);
+	// implementations should merge with whatever they already know.
+	//
+	// The values are [tailcfg.UserProfileView]s sharing backing memory
+	// with the caller's tracking map; implementations may store them
+	// directly without copying.
+	//
+	// It returns false to signal the caller to fall back to a full
+	// netmap rebuild. Proxy/forwarder implementations return false when
+	// their downstream destination doesn't implement
+	// [UserProfileUpdater]; concrete implementations return true on
+	// successful apply.
+	UpdateUserProfiles(profiles map[tailcfg.UserID]tailcfg.UserProfileView) bool
 }
 
 var nextControlClientID atomic.Int64
@@ -296,7 +339,7 @@ func NewDirect(opts Options) (*Direct, error) {
 	}
 	var interceptedDial *atomic.Bool
 	if httpc == nil {
-		tr := http.DefaultTransport.(*http.Transport).Clone()
+		tr := netutil.NewDefaultTransport()
 		if buildfeatures.HasUseProxy {
 			tr.Proxy = feature.HookProxyFromEnvironment.GetOrNil()
 			if f, ok := feature.HookProxySetTransportGetProxyConnectHeader.GetOk(); ok {
@@ -372,38 +415,6 @@ func NewDirect(opts Options) (*Direct, error) {
 	c.clientVersionPub = eventbus.Publish[tailcfg.ClientVersion](c.busClient)
 	c.autoUpdatePub = eventbus.Publish[AutoUpdate](c.busClient)
 	c.controlTimePub = eventbus.Publish[ControlTime](c.busClient)
-	discoKeyPub := eventbus.Publish[events.PeerDiscoKeyUpdate](c.busClient)
-	eventbus.SubscribeFunc(c.busClient, func(update events.DiscoKeyAdvertisement) {
-		c.logf("controlclient direct: got TSMP disco key advertisement from %v via eventbus", update.Src)
-		var peerID tailcfg.NodeID
-		var peerKey key.NodePublic
-		var ok bool
-		c.mu.Lock()
-		sess := c.streamingMapSession
-		c.mu.Unlock()
-		if sess != nil {
-			peerID, peerKey, ok = sess.PeerIDAndKeyByTailscaleIP(update.Src)
-		}
-
-		if sess != nil && ok {
-			c.logf("controlclient direct: updating discoKey for %v via mapSession", update.Src)
-
-			// If we update without error, return. If the err indicates that the
-			// mapSession has gone away, we want to fall back to pushing the key
-			// further down the chain.
-			if err := sess.updateDiscoForNode(
-				peerID, peerKey, update.Key, time.Now(), false); err == nil ||
-				!errors.Is(err, ErrChangeQueueClosed) {
-				return
-			}
-		}
-
-		// We need to push the update further down the chain. Either because we do
-		// not have a mapSession (we are not connected to control) or because the
-		// mapSession queue has closed.
-		c.logf("controlclient direct: updating discoKey for %v via magicsock", update.Src)
-		discoKeyPub.Publish(events.PeerDiscoKeyUpdate(update))
-	})
 
 	return c, nil
 }
@@ -608,6 +619,18 @@ func parseRateLimitError(res *http.Response) *rateLimitError {
 	return ret
 }
 
+// isRateLimitedResponse reports whether a non-200 response should be
+// treated as a rate limit rather than a generic failure subject to backoff.
+func isRateLimitedResponse(res *http.Response) bool {
+	switch res.StatusCode {
+	case http.StatusTooManyRequests:
+		return true
+	case http.StatusServiceUnavailable:
+		return res.Header.Get("Retry-After") != ""
+	}
+	return false
+}
+
 func (c *Direct) doLogin(ctx context.Context, opt loginOpt) (mustRegen bool, newURL string, nks tkatype.MarshaledSignature, err error) {
 	if c.panicOnUse {
 		panic("tainted client")
@@ -803,7 +826,7 @@ func (c *Direct) doLogin(ctx context.Context, opt loginOpt) (mustRegen bool, new
 		return regen, opt.URL, nil, fmt.Errorf("register request: %w", err)
 	}
 	// Handle 429 Too Many Requests with a specific error type that includes the retry-after duration.
-	if res.StatusCode == 429 {
+	if isRateLimitedResponse(res) {
 		rle := parseRateLimitError(res)
 		msg := fmt.Sprintf("node registration rate limited; will retry after %v", rle.retryAfter)
 		return false, "", nil, vizerror.WrapWithMessage(rle, msg)
@@ -918,10 +941,8 @@ func (c *Direct) PollNetMap(ctx context.Context, nu NetmapUpdater) error {
 // update it observed. It is used by tests and [NetmapFromMapResponseForDebug].
 // It will report only the first netmap seen.
 type rememberLastNetmapUpdater struct {
-	last          *netmap.NetworkMap
-	lastTSMPKey   key.NodePublic
-	lastTSMPDisco key.DiscoPublic
-	done          chan any
+	last *netmap.NetworkMap
+	done chan any
 }
 
 func (nu *rememberLastNetmapUpdater) UpdateFullNetmap(nm *netmap.NetworkMap) {
@@ -930,11 +951,6 @@ func (nu *rememberLastNetmapUpdater) UpdateFullNetmap(nm *netmap.NetworkMap) {
 	case nu.done <- nil:
 	default:
 	}
-}
-
-func (nu *rememberLastNetmapUpdater) PatchDiscoKey(key key.NodePublic, disco key.DiscoPublic) {
-	nu.lastTSMPKey = key
-	nu.lastTSMPDisco = disco
 }
 
 // FetchNetMapForTest fetches the netmap once.
@@ -1131,6 +1147,15 @@ func (c *Direct) sendMapRequest(ctx context.Context, isStreaming bool, nu Netmap
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	// The map response body is a stream of size-prefixed messages. Each
+	// message is capped by maxCompressedMapResponseSize and
+	// maxDecodedMapResponseSize, but a streaming session can carry an
+	// unbounded number of messages over one body, so the body itself must
+	// not be subject to ts2021.Client.Do's default response size cap.
+	// This must happen before the watchdog goroutine below captures ctx:
+	// reassigning ctx after the goroutine exists is a data race.
+	ctx = httpbody.WithMaxSize(ctx, 0)
+
 	machinePubKey := machinePrivKey.Public()
 	t0 := c.clock.Now()
 
@@ -1178,6 +1203,13 @@ func (c *Direct) sendMapRequest(ctx context.Context, isStreaming bool, nu Netmap
 	}
 	vlogf("netmap: Do = %v after %v", res.StatusCode, time.Since(t0).Round(time.Millisecond))
 	if res.StatusCode != 200 {
+		// The body is an error message rather than a message stream, so
+		// cap it: the map body itself is uncapped per the comment above.
+		httpbody.LimitSizeTo(res, httpbody.DefaultMaxSize)
+		if isRateLimitedResponse(res) {
+			rle := parseRateLimitError(res)
+			return fmt.Errorf("initial fetch failed %d: %w", res.StatusCode, rle)
+		}
 		msg, _ := io.ReadAll(res.Body)
 		res.Body.Close()
 		return fmt.Errorf("initial fetch failed %d: %.200s",
@@ -1193,22 +1225,8 @@ func (c *Direct) sendMapRequest(ctx context.Context, isStreaming bool, nu Netmap
 		return nil
 	}
 
-	if isStreaming && c.streamingMapSession != nil {
-		panic("mapSession is already set")
-	}
-
 	sess := newMapSession(persist.PrivateNodeKey(), nu, c.controlKnobs)
-	if isStreaming {
-		c.streamingMapSession = sess
-		defer func() {
-			sess.Close()
-			c.mu.Lock()
-			c.streamingMapSession = nil
-			c.mu.Unlock()
-		}()
-	} else {
-		defer sess.Close()
-	}
+	defer sess.Close()
 	sess.cancel = cancel
 	sess.logf = c.logf
 	sess.vlogf = vlogf
@@ -1248,19 +1266,22 @@ func (c *Direct) sendMapRequest(ctx context.Context, isStreaming bool, nu Netmap
 	for mapResIdx := 0; mapResIdx == 0 || isStreaming; mapResIdx++ {
 		watchdogTimer.Reset(watchdogTimeout)
 		vlogf("netmap: starting size read after %v (poll %v)", time.Since(t0).Round(time.Millisecond), mapResIdx)
-		var siz [4]byte
-		if _, err := io.ReadFull(res.Body, siz[:]); err != nil {
-			vlogf("netmap: size read error after %v: %v", time.Since(t0).Round(time.Millisecond), err)
+		msg, err = readMapResponseMessage(res.Body, msg)
+		if err != nil {
+			// If the read failed because the poll's context was
+			// canceled, report that instead of the underlying
+			// transport error. Which error the transport returns for
+			// a read interrupted by cancellation varies by transport
+			// and Go version (Go 1.27's http2 returns the underlying
+			// "use of closed network connection" where earlier
+			// versions returned the context error).
+			if ctx.Err() != nil {
+				err = ctx.Err()
+			}
+			vlogf("netmap: message read error after %v: %v", time.Since(t0).Round(time.Millisecond), err)
 			return err
 		}
-		size := binary.LittleEndian.Uint32(siz[:])
-		vlogf("netmap: read size %v after %v", size, time.Since(t0).Round(time.Millisecond))
-		msg = append(msg[:0], make([]byte, size)...)
-		if _, err := io.ReadFull(res.Body, msg); err != nil {
-			vlogf("netmap: body read error: %v", err)
-			return err
-		}
-		vlogf("netmap: read body after %v", time.Since(t0).Round(time.Millisecond))
+		vlogf("netmap: read message of %d bytes after %v", len(msg), time.Since(t0).Round(time.Millisecond))
 
 		var resp tailcfg.MapResponse
 		if err := sess.decodeMsg(msg, &resp); err != nil {
@@ -1315,12 +1336,12 @@ func (c *Direct) sendMapRequest(ctx context.Context, isStreaming bool, nu Netmap
 
 		// DefaultAutoUpdate in its CapMap and deprecated top-level field forms.
 		if self := resp.Node; self != nil {
-			for _, v := range self.CapMap[tailcfg.NodeAttrDefaultAutoUpdate] {
+			for _, v := range self.CapMap[nodecap.DefaultAutoUpdate] {
 				switch v {
 				case "true", "false":
 					c.autoUpdatePub.Publish(AutoUpdate{c.controlClientID, v == "true"})
 				default:
-					c.logf("netmap: [unexpected] unknown %s in CapMap: %q", tailcfg.NodeAttrDefaultAutoUpdate, v)
+					c.logf("netmap: [unexpected] unknown %s in CapMap: %q", nodecap.DefaultAutoUpdate, v)
 				}
 			}
 		}
@@ -1430,6 +1451,39 @@ var jsonEscapedZero = []byte(`\u0000`)
 
 const justKeepAliveStr = `{"KeepAlive":true}`
 
+// maxCompressedMapResponseSize bounds the on-the-wire size of a single map
+// response message. The size prefix is a little-endian uint32 the control
+// server chooses, so without a cap a malicious control server can make us
+// allocate up to 4 GiB before reading any body bytes. Real production traffic
+// has hit a 16 MB cap before, so the cap stays far above any plausible
+// legitimate size.
+const maxCompressedMapResponseSize = 256 << 20
+
+// maxDecodedMapResponseSize bounds the decompressed size of a single map
+// response message, so a malicious control server can't expand a small zstd
+// frame into an unbounded amount of JSON.
+const maxDecodedMapResponseSize = 1 << 30
+
+// readMapResponseMessage reads a single map response message from r: a
+// little-endian uint32 size followed by that many bytes. The returned message
+// reuses msg's backing storage. Sizes beyond [maxCompressedMapResponseSize]
+// are rejected before any allocation.
+func readMapResponseMessage(r io.Reader, msg []byte) ([]byte, error) {
+	var siz [4]byte
+	if _, err := io.ReadFull(r, siz[:]); err != nil {
+		return msg, err
+	}
+	size := binary.LittleEndian.Uint32(siz[:])
+	if size > maxCompressedMapResponseSize {
+		return msg, fmt.Errorf("map response message size %d exceeds max %d", size, maxCompressedMapResponseSize)
+	}
+	msg = append(msg[:0], make([]byte, size)...)
+	if _, err := io.ReadFull(r, msg); err != nil {
+		return msg, err
+	}
+	return msg, nil
+}
+
 // decodeMsg is responsible for uncompressing msg and unmarshaling into v.
 func (ms *mapSession) decodeMsg(compressedMsg []byte, v *tailcfg.MapResponse) error {
 	// Fast path for common case of keep-alive message.
@@ -1439,7 +1493,7 @@ func (ms *mapSession) decodeMsg(compressedMsg []byte, v *tailcfg.MapResponse) er
 		return nil
 	}
 
-	b, err := zstdframe.AppendDecode(nil, compressedMsg)
+	b, err := zstdframe.AppendDecode(nil, compressedMsg, zstdframe.MaxDecodedSize(maxDecodedMapResponseSize))
 	if err != nil {
 		return err
 	}
@@ -1489,7 +1543,8 @@ func loadServerPubKeys(ctx context.Context, httpc *http.Client, serverURL string
 		return nil, fmt.Errorf("fetch control key: %v", err)
 	}
 	defer res.Body.Close()
-	b, err := io.ReadAll(io.LimitReader(res.Body, 64<<10))
+	httpbody.LimitSizeTo(res, 64<<10)
+	b, err := io.ReadAll(res.Body)
 	if err != nil {
 		return nil, fmt.Errorf("fetch control key response: %v", err)
 	}

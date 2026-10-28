@@ -179,7 +179,7 @@ func (n *nftablesRunner) DNATNonTailscaleTraffic(tunname string, dst netip.Addr)
 		Table: nat,
 		Chain: preroutingCh,
 		Exprs: []expr.Any{
-			&expr.Meta{Key: expr.MetaKeyOIFNAME, Register: 1},
+			&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
 			&expr.Cmp{
 				Op:       expr.CmpOpNeq,
 				Register: 1,
@@ -248,11 +248,16 @@ func (n *nftablesRunner) EnsureSNATForDst(src, dst netip.Addr) error {
 
 // ClampMSSToPMTU ensures that all packets with TCP flags (SYN, ACK, RST) set
 // being forwarded via the given interface (tun) have MSS set to <MTU of the
-// interface> - 40 (IP and TCP headers). This can be useful if this tailscale
-// instance is expected to run as a forwarding proxy, forwarding packets from an
-// endpoint with higher MTU in an environment where path MTU discovery is
-// expected to not work (such as the proxies created by the Tailscale Kubernetes
-// operator). ClamMSSToPMTU creates a new base-chain ts-clamp in the filter
+// interface> - 40 (IP and TCP headers). It clamps both directions of a
+// forwarded TCP handshake: the SYN leaving via tun and the SYN-ACK arriving on
+// tun. Clamping only the output direction would leave the endpoint on the other
+// side of the proxy advertising an MSS that is too large for the tun MTU,
+// black-holing large segments when path MTU discovery is broken. This can be
+// useful if this tailscale instance is expected to run as a forwarding proxy,
+// forwarding packets from an endpoint with higher MTU in an environment where
+// path MTU discovery is expected to not work (such as the proxies created by
+// the Tailscale Kubernetes operator). ClampMSSToPMTU creates a new base-chain
+// ts-clamp in the filter
 // table with accept policy and priority -150. In practice, this means that for
 // SYN packets the clamp rule in this chain will likely run first and accept the
 // packet. This is fine because 1) nftables run ALL chains with the same hook
@@ -289,61 +294,75 @@ func (n *nftablesRunner) ClampMSSToPMTU(tun string, addr netip.Addr) error {
 		return fmt.Errorf("error ensuring forward chain: %w", err)
 	}
 
-	clampRule := &nftables.Rule{
-		Table: filterTable,
-		Chain: fwChain,
-		Exprs: []expr.Any{
-			&expr.Meta{Key: expr.MetaKeyOIFNAME, Register: 1},
-			&expr.Cmp{
-				Op:       expr.CmpOpEq,
-				Register: 1,
-				Data:     []byte(tun),
+	// clampRuleForIface builds a rule that clamps the MSS of forwarded TCP
+	// handshake packets matching tun on the given interface-name meta key.
+	// ifaceKey is either expr.MetaKeyOIFNAME (packets leaving via tun) or
+	// expr.MetaKeyIIFNAME (packets arriving on tun).
+	clampRuleForIface := func(ifaceKey expr.MetaKey) *nftables.Rule {
+		return &nftables.Rule{
+			Table: filterTable,
+			Chain: fwChain,
+			Exprs: []expr.Any{
+				&expr.Meta{Key: ifaceKey, Register: 1},
+				&expr.Cmp{
+					Op:       expr.CmpOpEq,
+					Register: 1,
+					Data:     []byte(tun),
+				},
+				&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
+				&expr.Cmp{
+					Op:       expr.CmpOpEq,
+					Register: 1,
+					Data:     []byte{unix.IPPROTO_TCP},
+				},
+				&expr.Payload{
+					DestRegister: 1,
+					Base:         expr.PayloadBaseTransportHeader,
+					Offset:       13,
+					Len:          1,
+				},
+				&expr.Bitwise{
+					DestRegister:   1,
+					SourceRegister: 1,
+					Len:            1,
+					Mask:           []byte{0x02},
+					Xor:            []byte{0x00},
+				},
+				&expr.Cmp{
+					Op:       expr.CmpOpNeq, // match any packet with a TCP flag set (SYN, ACK, RST)
+					Register: 1,
+					Data:     []byte{0x00},
+				},
+				&expr.Rt{
+					Register: 1,
+					Key:      expr.RtTCPMSS,
+				},
+				&expr.Byteorder{
+					DestRegister:   1,
+					SourceRegister: 1,
+					Op:             expr.ByteorderHton,
+					Len:            2,
+					Size:           2,
+				},
+				&expr.Exthdr{
+					SourceRegister: 1,
+					Type:           2,
+					Offset:         2,
+					Len:            2,
+					Op:             expr.ExthdrOpTcpopt,
+				},
 			},
-			&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
-			&expr.Cmp{
-				Op:       expr.CmpOpEq,
-				Register: 1,
-				Data:     []byte{unix.IPPROTO_TCP},
-			},
-			&expr.Payload{
-				DestRegister: 1,
-				Base:         expr.PayloadBaseTransportHeader,
-				Offset:       13,
-				Len:          1,
-			},
-			&expr.Bitwise{
-				DestRegister:   1,
-				SourceRegister: 1,
-				Len:            1,
-				Mask:           []byte{0x02},
-				Xor:            []byte{0x00},
-			},
-			&expr.Cmp{
-				Op:       expr.CmpOpNeq, // match any packet with a TCP flag set (SYN, ACK, RST)
-				Register: 1,
-				Data:     []byte{0x00},
-			},
-			&expr.Rt{
-				Register: 1,
-				Key:      expr.RtTCPMSS,
-			},
-			&expr.Byteorder{
-				DestRegister:   1,
-				SourceRegister: 1,
-				Op:             expr.ByteorderHton,
-				Len:            2,
-				Size:           2,
-			},
-			&expr.Exthdr{
-				SourceRegister: 1,
-				Type:           2,
-				Offset:         2,
-				Len:            2,
-				Op:             expr.ExthdrOpTcpopt,
-			},
-		},
+		}
 	}
-	n.conn.AddRule(clampRule)
+
+	// Clamp both directions of the forwarded handshake: the SYN leaving via
+	// tun towards the tailnet peer, and the SYN-ACK arriving on tun and being
+	// forwarded back out towards the originating endpoint. Matching only the
+	// output interface leaves the endpoint on the other side advertising an MSS
+	// that is too large for the tun MTU, which black-holes large segments when
+	// PMTU discovery is broken.
+	n.conn.AddRule(clampRuleForIface(expr.MetaKeyOIFNAME))
+	n.conn.AddRule(clampRuleForIface(expr.MetaKeyIIFNAME))
 	return n.conn.Flush()
 }
 
@@ -416,6 +435,9 @@ func (e errorChainNotFound) Error() string {
 // getChainFromTable returns the chain with the given name from the given table.
 // Note that a chain name is unique within a table.
 func getChainFromTable(c *nftables.Conn, table *nftables.Table, name string) (*nftables.Chain, error) {
+	if table == nil {
+		return nil, fmt.Errorf("could not get chain %q: table not initialized", name)
+	}
 	chains, err := c.ListChainsOfTableFamily(table.Family)
 	if err != nil {
 		return nil, fmt.Errorf("list chains: %w", err)
@@ -581,8 +603,9 @@ type NetfilterRunner interface {
 
 	DeleteSvc(svc, tun string, targetIPs []netip.Addr, pm []PortMap) error
 
-	// ClampMSSToPMTU adds a rule to the mangle/FORWARD chain to clamp MSS for
-	// traffic destined for the provided tun interface.
+	// ClampMSSToPMTU adds rules to clamp the MSS of forwarded TCP handshake
+	// packets in both directions (entering and leaving the provided tun
+	// interface), so both endpoints negotiate an MSS that fits the tun MTU.
 	ClampMSSToPMTU(tun string, addr netip.Addr) error
 
 	// AddMagicsockPortRule adds a rule to the ts-input chain to accept
@@ -1964,9 +1987,7 @@ func (n *nftablesRunner) DelSNATRule() error {
 }
 
 func nativeUint32(v uint32) []byte {
-	b := make([]byte, 4)
-	binary.NativeEndian.PutUint32(b, v)
-	return b
+	return nativeEndianUint32(v)
 }
 
 func makeStatefulRuleExprs(tunname string) []expr.Any {
@@ -2153,6 +2174,24 @@ func (n *nftablesRunner) DelStatefulRule(tunname string) error {
 
 // makeConnmarkRestoreExprs creates nftables expressions to restore mark from conntrack.
 // Implements: ct state established,related ct mark & 0xff0000 != 0 meta mark set ct mark & 0xff0000
+//
+// LIMITATION: Unlike iptables CONNMARK --restore-mark with --nfmask, this implementation
+// overwrites non-Tailscale bits in the packet mark rather than merging them. This is a
+// fundamental limitation of the Linux kernel's nftables expression VM (not the Go library).
+//
+// The nftables Bitwise expression only supports: (register & CONSTANT_MASK) ^ CONSTANT_XOR.
+// It cannot perform register-to-register operations needed for perfect bit preservation:
+//
+//	meta mark = (meta mark & ~0xff0000) | (ct mark & 0xff0000)
+//	                 ^^^^^                   ^^^^^^^
+//	            needs meta mark         and ct mark combined
+//
+// In contrast, iptables CONNMARK is a specialized kernel module with custom C code that
+// can atomically merge marks from different sources.
+//
+// The conditional check (ct mark & 0xff0000 != 0) prevents the worst case of wiping all
+// mark bits to zero. Perfect bit preservation would require kernel
+// changes to add register-to-register bitwise operations to nftables.
 func makeConnmarkRestoreExprs() []expr.Any {
 	return []expr.Any{
 		// Load conntrack state into register 1
@@ -2188,7 +2227,13 @@ func makeConnmarkRestoreExprs() []expr.Any {
 			Mask:           getTailscaleFwmarkMask(),
 			Xor:            []byte{0x00, 0x00, 0x00, 0x00},
 		},
-		// Set packet mark from register 1
+		// Check if masked ct mark is non-zero (critical: prevents wiping marks with 0)
+		&expr.Cmp{
+			Op:       expr.CmpOpNeq,
+			Register: 1,
+			Data:     []byte{0, 0, 0, 0},
+		},
+		// Set packet mark from register 1 (contains ct mark & 0xff0000)
 		&expr.Meta{
 			Key:            expr.MetaKeyMARK,
 			SourceRegister: true,

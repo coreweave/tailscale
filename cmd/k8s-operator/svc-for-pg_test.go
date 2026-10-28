@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net/netip"
+	"slices"
 	"testing"
 	"time"
 
@@ -258,7 +259,7 @@ func TestValidateService(t *testing.T) {
 					Status:             metav1.ConditionFalse,
 					Reason:             reasonIngressSvcInvalid,
 					LastTransitionTime: metav1.NewTime(cl.Now().Truncate(time.Second)),
-					Message:            `found duplicate Service "ns-2/my-app2" for hostname "my-app" - multiple HA Services for the same hostname in the same cluster are not allowed`,
+					Message:            `found duplicate Service "ns-2/my-app2" for hostname "my-app" - multiple HA Services for the same hostname on the same tailnet are not allowed`,
 				},
 			},
 		},
@@ -268,6 +269,142 @@ func TestValidateService(t *testing.T) {
 	mustCreate(t, lc, svc2)
 	expectReconciled(t, pgr, svc.Namespace, svc.Name)
 	expectEqual(t, lc, wantSvc)
+}
+
+// Regression test for #20069. The pre-fix duplicate-hostname check scanned
+// every Service with shouldExpose=true, which meant a Service exposed on
+// one tailnet via the single-proxy path (svc.go) would block a ProxyGroup
+// ingress Service for the same hostname on a different tailnet. The
+// ProxyGroup path's validateService must skip Services that aren't
+// themselves managed by a ProxyGroup.
+func TestValidateService_SingleProxyServiceDoesNotCollideWithProxyGroup(t *testing.T) {
+	pgr, _, lc, _, _ := setupServiceTest(t)
+	// Service exposed via the single-proxy path: tailscale.com/expose=true
+	// and no tailscale.com/proxy-group annotation. Its hostname matches
+	// the ProxyGroup-managed Service below, but it lives in a different
+	// reconciler entirely and must not be flagged as a duplicate.
+	singleProxySvc := &corev1.Service{
+		TypeMeta: metav1.TypeMeta{Kind: "Service", APIVersion: "v1"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "single-proxy",
+			Namespace: "ns-1",
+			UID:       types.UID("single-proxy-uid"),
+			Annotations: map[string]string{
+				"tailscale.com/expose":   "true",
+				"tailscale.com/hostname": "my-app",
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			ClusterIP: "1.2.3.4",
+			Type:      corev1.ServiceTypeClusterIP,
+		},
+	}
+	// ProxyGroup-managed Service for the same hostname.
+	pgSvc := &corev1.Service{
+		TypeMeta: metav1.TypeMeta{Kind: "Service", APIVersion: "v1"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pg-svc",
+			Namespace: "ns-2",
+			UID:       types.UID("pg-svc-uid"),
+			Annotations: map[string]string{
+				"tailscale.com/proxy-group": "test-pg",
+				"tailscale.com/hostname":    "my-app",
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			ClusterIP:         "1.2.3.5",
+			Type:              corev1.ServiceTypeLoadBalancer,
+			LoadBalancerClass: new("tailscale"),
+		},
+	}
+
+	mustCreate(t, lc, singleProxySvc)
+	mustCreate(t, lc, pgSvc)
+	expectReconciled(t, pgr, pgSvc.Namespace, pgSvc.Name)
+
+	got := &corev1.Service{}
+	if err := lc.Get(context.Background(), client.ObjectKeyFromObject(pgSvc), got); err != nil {
+		t.Fatalf("get Service: %v", err)
+	}
+	for _, c := range got.Status.Conditions {
+		if c.Type == string(tsapi.IngressSvcValid) && c.Status == metav1.ConditionFalse {
+			t.Fatalf("ProxyGroup Service flagged invalid by a single-proxy Service on a different tailnet: %s", c.Message)
+		}
+	}
+}
+
+// Regression test for #20069. Two ProxyGroup-managed Services with the same
+// hostname but joined to different tailnets each have their own DNS
+// namespace and must not be flagged as duplicates. The Service being
+// reconciled here is on the default tailnet (so it uses the configured
+// fake tsclient); the conflicting Service already exists in-cluster on
+// a different tailnet and must be skipped by the duplicate check.
+func TestValidateService_DifferentTailnetDoesNotCollide(t *testing.T) {
+	pgr, _, lc, _, _ := setupServiceTest(t)
+	// Pre-create a ProxyGroup joined to a different tailnet.
+	secondaryPG := &tsapi.ProxyGroup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "secondary-pg",
+			Generation: 1,
+		},
+		Spec: tsapi.ProxyGroupSpec{
+			Type:    tsapi.ProxyGroupTypeIngress,
+			Tailnet: "secondary",
+		},
+	}
+	if err := lc.Create(context.Background(), secondaryPG); err != nil {
+		t.Fatalf("create secondary ProxyGroup: %v", err)
+	}
+	// Pre-existing Service on the secondary tailnet with the conflicting hostname.
+	otherTailnetSvc := &corev1.Service{
+		TypeMeta: metav1.TypeMeta{Kind: "Service", APIVersion: "v1"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "other-tailnet-svc",
+			Namespace: "ns-2",
+			UID:       types.UID("other-tailnet-svc-uid"),
+			Annotations: map[string]string{
+				"tailscale.com/proxy-group": "secondary-pg",
+				"tailscale.com/hostname":    "my-app",
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			ClusterIP:         "1.2.3.5",
+			Type:              corev1.ServiceTypeLoadBalancer,
+			LoadBalancerClass: new("tailscale"),
+		},
+	}
+	mustCreate(t, lc, otherTailnetSvc)
+
+	// Service being reconciled: same hostname, default tailnet ProxyGroup.
+	primarySvc := &corev1.Service{
+		TypeMeta: metav1.TypeMeta{Kind: "Service", APIVersion: "v1"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "primary-svc",
+			Namespace: "ns-1",
+			UID:       types.UID("primary-svc-uid"),
+			Annotations: map[string]string{
+				"tailscale.com/proxy-group": "test-pg",
+				"tailscale.com/hostname":    "my-app",
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			ClusterIP:         "1.2.3.4",
+			Type:              corev1.ServiceTypeLoadBalancer,
+			LoadBalancerClass: new("tailscale"),
+		},
+	}
+	mustCreate(t, lc, primarySvc)
+	expectReconciled(t, pgr, primarySvc.Namespace, primarySvc.Name)
+
+	got := &corev1.Service{}
+	if err := lc.Get(context.Background(), client.ObjectKeyFromObject(primarySvc), got); err != nil {
+		t.Fatalf("get Service: %v", err)
+	}
+	for _, c := range got.Status.Conditions {
+		if c.Type == string(tsapi.IngressSvcValid) && c.Status == metav1.ConditionFalse {
+			t.Fatalf("ProxyGroup Service flagged invalid by a Service on a different tailnet with the same hostname: %s", c.Message)
+		}
+	}
 }
 
 func TestServicePGReconciler_MultiCluster(t *testing.T) {
@@ -413,4 +550,102 @@ func setupTestService(t *testing.T, svcName string, hostname string, clusterIP s
 	mustCreate(t, fc, eps)
 
 	return svc, eps
+}
+
+// TestServicePGReconciler_CleanupOnAnnotationRemoved is a regression test for
+// the case where the tailscale.com/proxy-group annotation is removed from a
+// Service that was previously exposed on a ProxyGroup. The reconciler must
+// clean up the Tailscale Service and remove its finalizer even though the
+// annotation (the only in-object record of the ProxyGroup) is gone, otherwise
+// the Tailscale Service leaks and the Service wedges forever on delete.
+func TestServicePGReconciler_CleanupOnAnnotationRemoved(t *testing.T) {
+	svcPGR, stateSecret, fc, ft, _ := setupServiceTest(t)
+
+	svc, _ := setupTestService(t, "test-service", "", "4.1.6.7", fc, stateSecret)
+	expectReconciled(t, svcPGR, "default", svc.Name)
+
+	verifyTailscaleService(t, ft, fmt.Sprintf("svc:default-%s", svc.Name), []string{"do-not-validate"})
+
+	// The finalizer must encode the ProxyGroup name so cleanup can recover it
+	// once the annotation is gone.
+	got := &corev1.Service{}
+	if err := fc.Get(t.Context(), types.NamespacedName{Namespace: svc.Namespace, Name: svc.Name}, got); err != nil {
+		t.Fatalf("getting Service: %v", err)
+	}
+	wantFinalizer := "test-pg.tailscale.com/service-pg-finalizer"
+	if !slices.Contains(got.Finalizers, wantFinalizer) {
+		t.Fatalf("finalizers = %v, want to contain %q", got.Finalizers, wantFinalizer)
+	}
+
+	// Remove the ProxyGroup annotation.
+	mustUpdate(t, fc, svc.Namespace, svc.Name, func(s *corev1.Service) {
+		delete(s.Annotations, AnnotationProxyGroup)
+	})
+	expectReconciled(t, svcPGR, "default", svc.Name)
+
+	// The Tailscale Service must be cleaned up.
+	if _, err := ft.VIPServices().Get(t.Context(), fmt.Sprintf("svc:default-%s", svc.Name)); err == nil {
+		t.Fatalf("Tailscale Service svc:default-%s not cleaned up after annotation removal", svc.Name)
+	} else if !tailscale.IsNotFound(err) {
+		t.Fatalf("unexpected error getting Tailscale Service: %v", err)
+	}
+
+	// The finalizer must be removed so the Service does not wedge on delete.
+	if err := fc.Get(t.Context(), types.NamespacedName{Namespace: svc.Namespace, Name: svc.Name}, got); err != nil {
+		t.Fatalf("getting Service: %v", err)
+	}
+	if slices.ContainsFunc(got.Finalizers, isServicePGFinalizer) {
+		t.Fatalf("service-pg finalizer not removed after annotation removal, finalizers = %v", got.Finalizers)
+	}
+}
+
+// TestServicePGReconciler_MigratesLegacyFinalizer verifies that a Service
+// carrying the bare legacy finalizer (set by an older operator) is migrated to
+// the ProxyGroup-encoded finalizer on reconcile, so a later annotation removal
+// remains recoverable.
+func TestServicePGReconciler_MigratesLegacyFinalizer(t *testing.T) {
+	svcPGR, stateSecret, fc, ft, _ := setupServiceTest(t)
+
+	svc, _ := setupTestService(t, "test-service", "", "4.1.6.7", fc, stateSecret)
+	mustUpdate(t, fc, svc.Namespace, svc.Name, func(s *corev1.Service) {
+		s.Finalizers = append(s.Finalizers, svcPGFinalizerName)
+	})
+
+	expectReconciled(t, svcPGR, "default", svc.Name)
+	verifyTailscaleService(t, ft, fmt.Sprintf("svc:default-%s", svc.Name), []string{"do-not-validate"})
+
+	got := &corev1.Service{}
+	if err := fc.Get(t.Context(), types.NamespacedName{Namespace: svc.Namespace, Name: svc.Name}, got); err != nil {
+		t.Fatalf("getting Service: %v", err)
+	}
+	if slices.Contains(got.Finalizers, svcPGFinalizerName) {
+		t.Fatalf("bare legacy finalizer not migrated, finalizers = %v", got.Finalizers)
+	}
+	wantFinalizer := "test-pg.tailscale.com/service-pg-finalizer"
+	if !slices.Contains(got.Finalizers, wantFinalizer) {
+		t.Fatalf("finalizers = %v, want to contain %q", got.Finalizers, wantFinalizer)
+	}
+}
+
+func TestProxyGroupFromServiceFinalizers(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		finalizers []string
+		wantPG     string
+		wantOK     bool
+	}{
+		{"encoded", []string{"test-pg.tailscale.com/service-pg-finalizer"}, "test-pg", true},
+		{"legacy_bare", []string{"tailscale.com/service-pg-finalizer"}, "", true},
+		{"none", []string{"tailscale.com/finalizer"}, "", false},
+		{"empty", nil, "", false},
+		{"encoded_among_others", []string{"tailscale.com/finalizer", "my-pg.tailscale.com/service-pg-finalizer"}, "my-pg", true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Finalizers: tt.finalizers}}
+			gotPG, gotOK := proxyGroupFromServiceFinalizers(svc)
+			if gotPG != tt.wantPG || gotOK != tt.wantOK {
+				t.Errorf("proxyGroupFromServiceFinalizers() = (%q, %v), want (%q, %v)", gotPG, gotOK, tt.wantPG, tt.wantOK)
+			}
+		})
+	}
 }
