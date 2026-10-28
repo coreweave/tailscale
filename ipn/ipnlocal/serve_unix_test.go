@@ -1,23 +1,27 @@
 // Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
-//go:build unix
+//go:build unix && !ts_omit_serve
 
 package ipnlocal
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"tailscale.com/ipn"
 	"tailscale.com/tstest"
 )
 
@@ -236,5 +240,217 @@ func TestServeBlocksTailscaledSocket(t *testing.T) {
 	}
 	if handler == nil {
 		t.Error("expected valid handler for legitimate socket")
+	}
+}
+
+func TestTCPForwardUnixSocket(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	socketPath := filepath.Join(tmpDir, "backend.sock")
+
+	// Create a Unix socket echo server
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("failed to create unix socket listener: %v", err)
+	}
+	defer listener.Close()
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				io.Copy(conn, conn) // echo
+			}()
+		}
+	}()
+
+	// Set up a LocalBackend with a ServeConfig that forwards TCP port 3128 to the unix socket
+	b := newTestBackend(t)
+	b.logf = tstest.WhileTestRunningLogger(t)
+
+	conf := &ipn.ServeConfig{
+		TCP: map[uint16]*ipn.TCPPortHandler{
+			3128: {TCPForward: "unix:" + socketPath},
+		},
+	}
+	if err := b.SetServeConfig(conf, ""); err != nil {
+		t.Fatal("setting serve config:", err)
+	}
+
+	// Get the handler from tcpHandlerForServe
+	srcAddr := netip.MustParseAddrPort("100.100.100.1:12345")
+	handler := b.tcpHandlerForServe(3128, srcAddr, nil)
+	if handler == nil {
+		t.Fatal("tcpHandlerForServe returned nil handler")
+	}
+
+	// Create a pipe to simulate an incoming connection
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+
+	// Run the handler in a goroutine
+	handlerDone := make(chan error, 1)
+	go func() {
+		handlerDone <- handler(serverConn)
+	}()
+
+	// Write data through the "client" side and read the echo back
+	testData := []byte("hello via tcpHandlerForServe")
+	if _, err := clientConn.Write(testData); err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+	buf := make([]byte, len(testData))
+	if _, err := io.ReadFull(clientConn, buf); err != nil {
+		t.Fatalf("read failed: %v", err)
+	}
+	if string(buf) != string(testData) {
+		t.Fatalf("echo mismatch: got %q, want %q", buf, testData)
+	}
+
+	// Close client side, handler should finish
+	clientConn.Close()
+	select {
+	case err := <-handlerDone:
+		if err != nil {
+			t.Fatalf("handler returned unexpected error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler did not finish in time")
+	}
+}
+
+// unixSocketTestDir returns a directory for creating unix sockets, on a
+// path short enough for sockaddr_un's sun_path limit.
+func unixSocketTestDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "ts-serve-unix-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	return dir
+}
+
+// mustListenUnix binds a unix listener at path, removing any existing file
+// there first (mkTempSocket leaves a regular file behind).
+func mustListenUnix(t *testing.T, path string) net.Listener {
+	t.Helper()
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close(); os.Remove(path) })
+	return ln
+}
+
+// serveUnixEchoListener binds an echoing unix listener at path.
+func serveUnixEchoListener(t *testing.T, path string) {
+	t.Helper()
+	ln := mustListenUnix(t, path)
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				io.Copy(c, c)
+			}()
+		}
+	}()
+}
+
+// TestRefuseIfConnectedToTailscaledSocket verifies the post-dial peer
+// check: the peer of a unix connection is named by the path its listener
+// was bound to, not the path dialed, so a connection to the tailscaled
+// socket is refused, including one made through a symlink
+func TestRefuseIfConnectedToTailscaledSocket(t *testing.T) {
+	dir := unixSocketTestDir(t)
+	tsSock := filepath.Join(dir, "tailscaled.sock")
+	mustListenUnix(t, tsSock)
+
+	b := newTestBackend(t)
+	b.sys.SocketPath = tsSock
+
+	// Skip if this platform does not name path-bound peers.
+	c, err := net.Dial("unix", tsSock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	ua, ok := c.RemoteAddr().(*net.UnixAddr)
+	if !ok || ua.Name == "" {
+		t.Skipf("platform does not name unix socket peers (RemoteAddr = %v)", c.RemoteAddr())
+	}
+
+	if err := b.refuseIfConnectedToTailscaledSocket(c); !errors.Is(err, ErrProxyToTailscaledSocket) {
+		t.Fatalf("refuseIfConnectedToTailscaledSocket(tailscaled peer) = %v; want ErrProxyToTailscaledSocket", err)
+	}
+
+	// A connection through a symlink still names the bound path.
+	alias := filepath.Join(dir, "alias.sock")
+	if err := os.Symlink(tsSock, alias); err != nil {
+		t.Fatal(err)
+	}
+	c, err = net.Dial("unix", alias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if err := b.refuseIfConnectedToTailscaledSocket(c); !errors.Is(err, ErrProxyToTailscaledSocket) {
+		t.Fatalf("refuseIfConnectedToTailscaledSocket(symlinked tailscaled peer) = %v; want ErrProxyToTailscaledSocket", err)
+	}
+
+	// A connection to any other socket is left alone.
+	benign := filepath.Join(dir, "benign.sock")
+	mustListenUnix(t, benign)
+	c, err = net.Dial("unix", benign)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if err := b.refuseIfConnectedToTailscaledSocket(c); err != nil {
+		t.Fatalf("refuseIfConnectedToTailscaledSocket(benign peer) = %v; want nil", err)
+	}
+}
+
+// TestDialServeUnixSocketServesBenignBackend dials a benign unix backend
+// end to end through dialServeUnixSocket and checks that traffic flows.
+func TestDialServeUnixSocketServesBenignBackend(t *testing.T) {
+	dir := unixSocketTestDir(t)
+	// The backend is behind a symlink, as a serve config may reference it.
+	backend := filepath.Join(dir, "backend.sock")
+	serveUnixEchoListener(t, backend)
+	alias := filepath.Join(dir, "alias.sock")
+	if err := os.Symlink(backend, alias); err != nil {
+		t.Fatal(err)
+	}
+
+	b := newTestBackend(t)
+
+	conn, err := b.dialServeUnixSocket(context.Background(), alias)
+	if err != nil {
+		t.Fatalf("dialServeUnixSocket(%q) = %v; want connection", alias, err)
+	}
+	defer conn.Close()
+
+	msg := []byte("hello backend")
+	if _, err := conn.Write(msg); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(msg))
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, msg) {
+		t.Fatalf("echo = %q; want %q", got, msg)
 	}
 }

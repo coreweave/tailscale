@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"go4.org/mem"
+	"golang.org/x/net/http/httpguts"
 	"tailscale.com/derp"
 	"tailscale.com/derp/derpconst"
 	"tailscale.com/envknob"
@@ -60,6 +61,7 @@ type Client struct {
 	DNSCache      *dnscache.Resolver // optional; nil means no caching
 	MeshKey       key.DERPMesh       // optional; for trusted clients
 	IsProber      bool               // optional; for probers to optional declare themselves as such
+	AppName       string             // optional; opaque app name to advertise to the server for stats
 
 	// WatchConnectionChanges is whether the client wishes to subscribe to
 	// notifications about clients connecting & disconnecting.
@@ -179,7 +181,7 @@ func NewClient(privateKey key.NodePrivate, serverURL string, logf logger.Logf, n
 
 // isStarted reports whether this client has been used yet.
 //
-// If if reports false, it may still have its exported fields configured.
+// If it reports false, it may still have its exported fields configured.
 func (c *Client) isStarted() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -280,10 +282,16 @@ func (c *Client) urlString(node *tailcfg.DERPNode) string {
 		return c.url.String()
 	}
 	proto := "https"
+	defaultPort := 443
 	if debugUseDERPHTTP() {
 		proto = "http"
+		defaultPort = 80
 	}
-	return fmt.Sprintf("%s://%s/derp", proto, node.HostName)
+	host := node.HostName
+	if node.DERPPort != 0 && node.DERPPort != defaultPort {
+		host = net.JoinHostPort(host, fmt.Sprint(node.DERPPort))
+	}
+	return fmt.Sprintf("%s://%s/derp", proto, host)
 }
 
 // AddressFamilySelector decides whether IPv6 is preferred for
@@ -327,6 +335,9 @@ func useWebsockets() bool {
 	}
 	return false
 }
+
+// maxErrBodyBytes is how much of a non-101 response body to include in the connect error message.
+const maxErrBodyBytes = 1 << 10
 
 func (c *Client) connect(ctx context.Context, caller string) (client *derp.Client, connGen int, err error) {
 	c.mu.Lock()
@@ -407,6 +418,7 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
 			derp.MeshKey(c.MeshKey),
 			derp.CanAckPings(c.canAckPings),
 			derp.IsProber(c.IsProber),
+			derp.AppName(c.AppName),
 		)
 		if err != nil {
 			return nil, 0, err
@@ -542,9 +554,9 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
 			return nil, 0, err
 		}
 		if resp.StatusCode != http.StatusSwitchingProtocols {
-			b, _ := io.ReadAll(resp.Body)
+			b, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrBodyBytes))
 			resp.Body.Close()
-			return nil, 0, fmt.Errorf("GET failed: %v: %s", err, b)
+			return nil, 0, fmt.Errorf("GET failed: status %v: %q", resp.Status, b)
 		}
 	}
 	derpClient, err = derp.NewClient(c.privateKey, httpConn, brw, c.logf,
@@ -552,6 +564,7 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
 		derp.ServerPublicKey(serverPub),
 		derp.CanAckPings(c.canAckPings),
 		derp.IsProber(c.IsProber),
+		derp.AppName(c.AppName),
 	)
 	if err != nil {
 		return nil, 0, err
@@ -836,6 +849,16 @@ func firstStr(a, b string) string {
 
 // dialNodeUsingProxy connects to n using a CONNECT to the HTTP(s) proxy in proxyURL.
 func (c *Client) dialNodeUsingProxy(ctx context.Context, n *tailcfg.DERPNode, proxyURL *url.URL) (_ net.Conn, err error) {
+	// n.HostName comes from the control-supplied DERP map and is written
+	// verbatim into the CONNECT request line and Host header below. Reject
+	// anything that isn't a valid host value so a hostname carrying CR/LF (or
+	// other control bytes) can't inject extra headers or a second request into
+	// the proxy connection. ValidHostHeader accepts the empty string, so check
+	// for that separately.
+	if n.HostName == "" || !httpguts.ValidHostHeader(n.HostName) {
+		return nil, fmt.Errorf("derphttp: invalid DERP node hostname %q", n.HostName)
+	}
+
 	pu := proxyURL
 	var proxyConn net.Conn
 	if pu.Scheme == "https" {
@@ -867,7 +890,15 @@ func (c *Client) dialNodeUsingProxy(ctx context.Context, n *tailcfg.DERPNode, pr
 		}
 	}()
 
-	target := net.JoinHostPort(n.HostName, "443")
+	// Keep port selection in sync with dialNode.
+	port := "443"
+	if !c.useHTTPS() {
+		port = "3340"
+	}
+	if n.DERPPort != 0 {
+		port = fmt.Sprint(n.DERPPort)
+	}
+	target := net.JoinHostPort(n.HostName, port)
 
 	var authHeader string
 	if buildfeatures.HasUseProxy {
@@ -1002,7 +1033,9 @@ func (c *Client) LocalAddr() (netip.AddrPort, error) {
 	return la, nil
 }
 
-func (c *Client) ForwardPacket(from, to key.NodePublic, b []byte) error {
+// ForwardPacket forwards b from the node from to the node to over the
+// mesh connection. It does not retain b after it returns.
+func (c *Client) ForwardPacket(from, to key.NodePublic, b derp.LoanedBytes) error {
 	client, _, err := c.connect(c.newContext(), "derphttp.Client.ForwardPacket")
 	if err != nil {
 		return err

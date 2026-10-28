@@ -21,6 +21,7 @@ import (
 	"tailscale.com/net/udprelay/status"
 	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/views"
@@ -33,7 +34,9 @@ import (
 const featureName = "relayserver"
 
 func init() {
-	feature.Register(featureName)
+	if !feature.Register(featureName) {
+		return
+	}
 	ipnext.RegisterExtension(featureName, newExtension)
 	localapi.Register("debug-peer-relay-sessions", servePeerRelayDebugSessions)
 }
@@ -69,7 +72,7 @@ func servePeerRelayDebugSessions(h *localapi.Handler, w http.ResponseWriter, r *
 func newExtension(logf logger.Logf, sb ipnext.SafeBackend) (ipnext.Extension, error) {
 	e := &extension{
 		newServerFn: func(logf logger.Logf, port uint16, onlyStaticAddrPorts bool) (relayServer, error) {
-			return udprelay.NewServer(logf, port, onlyStaticAddrPorts, sb.Sys().UserMetricsRegistry())
+			return udprelay.NewServer(logf, port, onlyStaticAddrPorts, sb.Sys().UserMetricsRegistry(), sb.Sys().ControlKnobs())
 		},
 		logf: logger.WithPrefix(logf, featureName+": "),
 	}
@@ -209,7 +212,7 @@ func (e *extension) handleRelayServerStaticAddrPortsLocked() {
 func (e *extension) selfNodeViewChanged(nodeView tailcfg.NodeView) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.hasNodeAttrDisableRelayServer = nodeView.HasCap(tailcfg.NodeAttrDisableRelayServer)
+	e.hasNodeAttrDisableRelayServer = nodeView.HasCap(nodecap.DisableRelayServer)
 	e.handleRelayServerLifetimeLocked()
 }
 

@@ -367,6 +367,8 @@ func TestAddAndDelConnmarkSaveRule(t *testing.T) {
 	preroutingArgs := []string{
 		"-m", "conntrack",
 		"--ctstate", "ESTABLISHED,RELATED",
+		"-m", "connmark",
+		"!", "--mark", "0x0/0xff0000",
 		"-j", "CONNMARK",
 		"--restore-mark",
 		"--nfmask", "0xff0000",
@@ -553,5 +555,38 @@ func TestAddAndDelCGNATRules(t *testing.T) {
 				t.Errorf("mode %q: rule %s/%s/%s not deleted", tt.mode, tr.table, tr.chain, strings.Join(tr.args, " "))
 			}
 		}
+	}
+}
+
+// TestDelLoopbackRuleMissing verifies DelLoopbackRule is a no-op (not an error)
+// when the rule is absent, so removing an address whose loopback rule was never
+// added in this instance -- e.g. one left on the interface by a previous
+// tailscaled -- isn't blocked. See tailscale/tailscale#19974.
+func TestDelLoopbackRuleMissing(t *testing.T) {
+	iptr := newFakeIPTablesRunner()
+	if err := iptr.AddChains(); err != nil {
+		t.Fatal(err)
+	}
+	defer iptr.DelChains()
+
+	addr := netip.MustParseAddr("100.64.0.99")
+	rule := []string{"-i", "lo", "-s", addr.String(), "-j", "ACCEPT"}
+
+	// No AddLoopbackRule for addr, so its rule is absent. Delete must not error.
+	if err := iptr.DelLoopbackRule(addr); err != nil {
+		t.Fatalf("DelLoopbackRule with no rule present: %v", err)
+	}
+
+	// And it still deletes the rule when present.
+	if err := iptr.AddLoopbackRule(addr); err != nil {
+		t.Fatal(err)
+	}
+	if err := iptr.DelLoopbackRule(addr); err != nil {
+		t.Fatalf("DelLoopbackRule with rule present: %v", err)
+	}
+	if exists, err := iptr.ipt4.Exists("filter", "ts-input", rule...); err != nil {
+		t.Fatal(err)
+	} else if exists {
+		t.Error("loopback rule still present after DelLoopbackRule")
 	}
 }

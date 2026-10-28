@@ -7,6 +7,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	_ "embed"
 	"encoding/base64"
 	"encoding/json"
@@ -32,15 +33,20 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"golang.org/x/sys/unix"
+	"tailscale.com/client/local"
 	"tailscale.com/cmd/testwrapper/flakytest"
 	"tailscale.com/health"
 	"tailscale.com/ipn"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/kube/egressservices"
 	"tailscale.com/kube/kubeclient"
 	"tailscale.com/kube/kubetypes"
+	klc "tailscale.com/kube/localclient"
+	"tailscale.com/net/memnet"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest"
-	"tailscale.com/types/netmap"
+	"tailscale.com/types/key"
+	"tailscale.com/types/views"
 )
 
 const configFileAuthKey = "some-auth-key"
@@ -52,6 +58,7 @@ func TestContainerBoot(t *testing.T) {
 		t.Fatalf("Building containerboot: %v", err)
 	}
 	egressStatus := egressSvcStatus("foo", "foo.tailnetxyz.ts.net", "100.64.0.2")
+	egressStatusUpdated := egressSvcStatus("foo", "foo.tailnetxyz.ts.net", "100.64.0.3")
 
 	metricsURL := func(port int) string {
 		return fmt.Sprintf("http://127.0.0.1:%d/metrics", port)
@@ -70,12 +77,6 @@ func TestContainerBoot(t *testing.T) {
 		// initial update for any future new watchers, then wait for all the
 		// Waits below to be true before proceeding to the next phase.
 		Notify *ipn.Notify
-
-		// If non-nil, install this NetMap on the fake LocalAPI before
-		// sending Notify. This is the replacement for the old
-		// Notify.NetMap field; reactive consumers fetch the current
-		// netmap via /localapi/v0/netmap on their own.
-		NetMap *netmap.NetworkMap
 
 		// WantCmds is the commands that containerboot should run in this phase.
 		WantCmds []string
@@ -392,19 +393,12 @@ func TestContainerBoot(t *testing.T) {
 								Name:      "test-node.test.ts.net.",
 								Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
 							},
-						},
-						NetMap: &netmap.NetworkMap{
-							SelfNode: (&tailcfg.Node{
-								StableID:  tailcfg.StableNodeID("myID"),
-								Name:      "test-node.test.ts.net.",
-								Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
-							}).View(),
-							Peers: []tailcfg.NodeView{
-								(&tailcfg.Node{
+							PeersChanged: []*tailcfg.Node{
+								{
 									StableID:  tailcfg.StableNodeID("ipv6ID"),
 									Name:      "ipv6-node.test.ts.net.",
 									Addresses: []netip.Prefix{netip.MustParsePrefix("::1/128")},
-								}).View(),
+								},
 							},
 						},
 						WantLog:      "no forwarding rules for egress addresses [::1/128], host supports IPv6: false",
@@ -645,13 +639,6 @@ func TestContainerBoot(t *testing.T) {
 								Name:      "new-name.test.ts.net.",
 								Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
 							},
-						},
-						NetMap: &netmap.NetworkMap{
-							SelfNode: (&tailcfg.Node{
-								StableID:  tailcfg.StableNodeID("newID"),
-								Name:      "new-name.test.ts.net.",
-								Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
-							}).View(),
 						},
 						WantKubeSecret: map[string]string{
 							"authkey":           "tskey-key",
@@ -1114,19 +1101,12 @@ func TestContainerBoot(t *testing.T) {
 								Name:      "test-node.test.ts.net.",
 								Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
 							},
-						},
-						NetMap: &netmap.NetworkMap{
-							SelfNode: (&tailcfg.Node{
-								StableID:  tailcfg.StableNodeID("myID"),
-								Name:      "test-node.test.ts.net.",
-								Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
-							}).View(),
-							Peers: []tailcfg.NodeView{
-								(&tailcfg.Node{
+							PeersChanged: []*tailcfg.Node{
+								{
 									StableID:  tailcfg.StableNodeID("fooID"),
 									Name:      "foo.tailnetxyz.ts.net.",
 									Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.2/32")},
-								}).View(),
+								},
 							},
 						},
 						WantKubeSecret: map[string]string{
@@ -1139,6 +1119,23 @@ func TestContainerBoot(t *testing.T) {
 						},
 						EndpointStatuses: map[string]int{
 							egressSvcTerminateURL(env.localAddrPort): 200,
+						},
+					},
+					{
+						Notify: &ipn.Notify{
+							PeersChanged: []*tailcfg.Node{{
+								StableID:  tailcfg.StableNodeID("fooID"),
+								Name:      "foo.tailnetxyz.ts.net.",
+								Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.3/32")},
+							}},
+						},
+						WantKubeSecret: map[string]string{
+							"egress-services":   string(mustJSON(t, egressStatusUpdated)),
+							"authkey":           "tskey-key",
+							"device_fqdn":       "test-node.test.ts.net.",
+							"device_id":         "myID",
+							"device_ips":        `["100.64.0.1"]`,
+							kubetypes.KeyCapVer: capver,
 						},
 					},
 				},
@@ -1294,18 +1291,6 @@ func TestContainerBoot(t *testing.T) {
 					if err := os.Chtimes(fullPath, now, now); err != nil {
 						t.Fatalf("phase %d: updating mtime for %q: %v", i, path, err)
 					}
-				}
-				nmForFake := p.NetMap
-				if nmForFake == nil && p.Notify != nil && p.Notify.SelfChange != nil {
-					// Synthesize a minimal netmap from SelfChange so
-					// containerboot's NetMap() fetch returns
-					// something usable when the test only set Notify.
-					nmForFake = &netmap.NetworkMap{
-						SelfNode: p.Notify.SelfChange.View(),
-					}
-				}
-				if nmForFake != nil {
-					env.lapi.SetNetMap(nmForFake)
 				}
 				env.lapi.Notify(p.Notify)
 				if p.Signal != nil {
@@ -1499,7 +1484,7 @@ type localAPI struct {
 	sync.Mutex
 	cond   *sync.Cond
 	notify *ipn.Notify
-	netmap *netmap.NetworkMap // served by /localapi/v0/netmap
+	status *ipnstate.Status
 }
 
 func (lc *localAPI) Start() error {
@@ -1533,47 +1518,74 @@ func (lc *localAPI) Notify(n *ipn.Notify) {
 	lc.Lock()
 	defer lc.Unlock()
 	lc.notify = n
+	if n.InitialStatus != nil {
+		lc.status = n.InitialStatus
+	} else if lc.status == nil {
+		lc.status = statusFromNotify(n)
+	} else {
+		if n.State != nil {
+			lc.status.BackendState = n.State.String()
+		}
+		if n.SelfChange != nil {
+			lc.status.Self = peerStatusFromNode(n.SelfChange.View())
+		}
+		for _, p := range n.PeersChanged {
+			if lc.status.Peer == nil {
+				lc.status.Peer = map[key.NodePublic]*ipnstate.PeerStatus{}
+			}
+			pv := p.View()
+			lc.status.Peer[pv.Key()] = peerStatusFromNode(pv)
+		}
+		for _, id := range n.PeersRemoved {
+			for k, p := range lc.status.Peer {
+				if p.NodeID == id {
+					delete(lc.status.Peer, k)
+				}
+			}
+		}
+	}
 	lc.cond.Broadcast()
 }
 
-// SetNetMap installs the netmap that the fake /localapi/v0/netmap endpoint
-// will return.
-func (lc *localAPI) SetNetMap(nm *netmap.NetworkMap) {
-	lc.Lock()
-	defer lc.Unlock()
-	lc.netmap = nm
+func statusFromNotify(n *ipn.Notify) *ipnstate.Status {
+	st := new(ipnstate.Status)
+	if n.State != nil {
+		st.BackendState = n.State.String()
+	}
+	if n.SelfChange != nil {
+		st.Self = peerStatusFromNode(n.SelfChange.View())
+	}
+	if len(n.PeersChanged) != 0 {
+		st.Peer = map[key.NodePublic]*ipnstate.PeerStatus{}
+		for _, p := range n.PeersChanged {
+			pv := p.View()
+			st.Peer[pv.Key()] = peerStatusFromNode(pv)
+		}
+	}
+	return st
+}
+
+func peerStatusFromNode(n tailcfg.NodeView) *ipnstate.PeerStatus {
+	ps := &ipnstate.PeerStatus{
+		ID:        n.StableID(),
+		NodeID:    n.ID(),
+		PublicKey: n.Key(),
+		DNSName:   n.Name(),
+	}
+	for _, p := range n.Addresses().All() {
+		if p.IsSingleIP() {
+			ps.TailscaleIPs = append(ps.TailscaleIPs, p.Addr())
+		}
+	}
+	if n.AllowedIPs().Len() != 0 {
+		v := n.AllowedIPs()
+		ps.AllowedIPs = &v
+	}
+	return ps
 }
 
 func (lc *localAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
-	case "/localapi/v0/netmap":
-		w.Header().Set("Content-Type", "application/json")
-		lc.Lock()
-		nm := lc.netmap
-		lc.Unlock()
-		if nm == nil {
-			http.Error(w, "no netmap", http.StatusServiceUnavailable)
-			return
-		}
-		json.NewEncoder(w).Encode(nm)
-		return
-	case "/localapi/v0/debug":
-		// containerboot fetches the netmap via the "current-netmap"
-		// debug action; serve it like /localapi/v0/netmap above.
-		if r.URL.Query().Get("action") != "current-netmap" {
-			http.Error(w, "unsupported debug action", http.StatusNotFound)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		lc.Lock()
-		nm := lc.netmap
-		lc.Unlock()
-		if nm == nil {
-			http.Error(w, "no netmap", http.StatusServiceUnavailable)
-			return
-		}
-		json.NewEncoder(w).Encode(nm)
-		return
 	case "/localapi/v0/serve-config":
 		switch r.Method {
 		case "GET":
@@ -1628,9 +1640,15 @@ func (lc *localAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	enc := json.NewEncoder(w)
 	lc.Lock()
 	defer lc.Unlock()
+	first := true
 	for {
 		if lc.notify != nil {
-			if err := enc.Encode(lc.notify); err != nil {
+			n := *lc.notify
+			if first {
+				n.InitialStatus = lc.status
+				first = false
+			}
+			if err := enc.Encode(&n); err != nil {
 				// Usually broken pipe as the test client disconnects.
 				return
 			}
@@ -1957,5 +1975,193 @@ func newTestEnv(t *testing.T) testEnv {
 		runningSockPath: runningSockPath,
 		localAddrPort:   localAddrPort,
 		healthAddrPort:  healthAddrPort,
+	}
+}
+
+// TestProcessNotifyRefreshesDNSOnSelfChange verifies that a SelfChange
+// notification triggers a DNS refresh; without it, VIPServices created
+// after pod boot are invisible to resolveTailnetFQDN.
+func TestProcessNotifyRefreshesDNSOnSelfChange(t *testing.T) {
+	extraRec := tailcfg.DNSRecord{
+		Name:  "my-ingress.tailnet.ts.net.",
+		Type:  "A",
+		Value: "100.99.10.20",
+	}
+	dnsCfg := &tailcfg.DNSConfig{
+		ExtraRecords: []tailcfg.DNSRecord{extraRec},
+		CertDomains:  []string{"node.tailnet.ts.net"},
+	}
+
+	lal := memnet.Listen("local-tailscaled.sock:80")
+	defer lal.Close()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/localapi/v0/dns-config", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(dnsCfg); err != nil {
+			t.Errorf("encoding dns config: %v", err)
+		}
+	})
+	srv := &http.Server{Handler: mux}
+	go srv.Serve(lal)
+	t.Cleanup(func() { srv.Shutdown(context.Background()) })
+
+	client := &local.Client{Dial: lal.Dial}
+
+	// Empty starting state, as if the InitialStatus captured at pod
+	// boot carried no ExtraRecords because the VIPService didn't exist
+	// yet at that time.
+	var s netmapState
+
+	n := ipn.Notify{
+		SelfChange: &tailcfg.Node{
+			ID:   1,
+			Name: "self.tailnet.ts.net.",
+		},
+	}
+
+	got := s.processNotify(context.Background(), client, n)
+
+	if got.dnsExtraRecords.Len() != 1 {
+		t.Fatalf("dnsExtraRecords.Len() = %d, want 1", got.dnsExtraRecords.Len())
+	}
+	if rec := got.dnsExtraRecords.At(0); rec.Name != extraRec.Name {
+		t.Errorf("dnsExtraRecords[0].Name = %q, want %q", rec.Name, extraRec.Name)
+	}
+	if got.certDomains.Len() != 1 || got.certDomains.At(0) != "node.tailnet.ts.net" {
+		t.Errorf("certDomains = %v, want [node.tailnet.ts.net]", got.certDomains.AsSlice())
+	}
+}
+
+func TestContainerbootWatchMask(t *testing.T) {
+	const base = ipn.NotifyInitialStatus | ipn.NotifyNoNetMap
+	tests := []struct {
+		name string
+		cfg  settings
+		want ipn.NotifyWatchOpt
+	}{
+		{name: "subnet_router", cfg: settings{Routes: new("10.0.0.0/8")}, want: base},
+		{name: "tailnet_target_IP", cfg: settings{TailnetTargetIP: "100.64.0.1"}, want: base},
+		{name: "tailnet_target_FQDN", cfg: settings{TailnetTargetFQDN: "target.example.ts.net"}, want: base | ipn.NotifyPeerChanges},
+		{name: "egress_services", cfg: settings{EgressProxiesCfgPath: "/etc/egress-services"}, want: base | ipn.NotifyPeerChanges},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := containerbootWatchMask(&tt.cfg); got != tt.want {
+				t.Errorf("containerbootWatchMask() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestUpdateFromStatusReplacesState(t *testing.T) {
+	oldPeer := &tailcfg.Node{ID: 1, StableID: "old", Name: "old.example.ts.net."}
+	s := netmapState{
+		self:            oldPeer.View(),
+		certDomains:     views.SliceOf([]string{"old.example.ts.net"}),
+		dnsExtraRecords: views.SliceOf([]tailcfg.DNSRecord{{Name: "old.example.ts.net."}}),
+	}.upsertPeer(oldPeer.View())
+
+	got := s.updateFromStatus(new(ipnstate.Status))
+	if got.self.Valid() {
+		t.Error("self remained valid after an empty authoritative status")
+	}
+	if got.peersByID != nil && got.peersByID.Len() != 0 {
+		t.Errorf("peer count = %d, want 0", got.peersByID.Len())
+	}
+	if got.certDomains.Len() != 0 || got.dnsExtraRecords.Len() != 0 {
+		t.Error("DNS state remained after an empty authoritative status")
+	}
+}
+
+type scriptedIPNBusWatcher struct {
+	notifies []ipn.Notify
+	err      error
+}
+
+func (w *scriptedIPNBusWatcher) Close() error { return nil }
+
+func (w *scriptedIPNBusWatcher) Next() (ipn.Notify, error) {
+	if len(w.notifies) == 0 {
+		return ipn.Notify{}, w.err
+	}
+	n := w.notifies[0]
+	w.notifies = w.notifies[1:]
+	return n, nil
+}
+
+func TestReconnectingIPNBusWatcher(t *testing.T) {
+	terminalMessage := "IPN bus consumer fell behind; closing watch"
+	watches := []*scriptedIPNBusWatcher{
+		{notifies: []ipn.Notify{{ErrMessage: &terminalMessage}}, err: io.EOF},
+		{notifies: []ipn.Notify{{InitialStatus: &ipnstate.Status{BackendState: ipn.Running.String()}}}, err: io.EOF},
+	}
+	var (
+		mu    sync.Mutex
+		masks []ipn.NotifyWatchOpt
+	)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	watch := func(_ context.Context, mask ipn.NotifyWatchOpt) (klc.IPNBusWatcher, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		masks = append(masks, mask)
+		if len(watches) == 0 {
+			return nil, errors.New("no scripted watcher")
+		}
+		w := watches[0]
+		watches = watches[1:]
+		return w, nil
+	}
+	mask := ipn.NotifyInitialStatus | ipn.NotifyNoNetMap
+	w := newReconnectingIPNBusWatcher(ctx, "test", watch, mask, time.Millisecond)
+	defer w.Close()
+
+	n, err := w.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n.ErrMessage == nil || *n.ErrMessage != terminalMessage {
+		t.Fatalf("first notification = %+v, want terminal error", n)
+	}
+
+	n, err = w.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n.InitialStatus == nil || n.InitialStatus.BackendState != ipn.Running.String() {
+		t.Fatalf("notification = %+v, want replacement running status", n)
+	}
+	cancel()
+	if _, err := w.Next(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Next error = %v, want context.Canceled", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(masks) < 2 {
+		t.Fatalf("watch attempts = %d, want at least 2", len(masks))
+	}
+	for i, got := range masks[:2] {
+		if got != mask {
+			t.Errorf("watch attempt %d mask = %v, want %v", i, got, mask)
+		}
+	}
+}
+
+func TestReconnectingIPNBusWatcherGivesUpOnDialFailure(t *testing.T) {
+	dialErr := errors.New("connection refused")
+	var attempts int
+	watch := func(context.Context, ipn.NotifyWatchOpt) (klc.IPNBusWatcher, error) {
+		attempts++
+		return nil, dialErr
+	}
+	w := newReconnectingIPNBusWatcher(t.Context(), "test", watch, ipn.NotifyInitialStatus, time.Millisecond)
+	w.maxDialFailure = 20 * time.Millisecond
+
+	if _, err := w.Next(); !errors.Is(err, dialErr) {
+		t.Fatalf("Next error = %v, want %v", err, dialErr)
+	}
+	if attempts < 2 {
+		t.Errorf("watch attempts = %d, want at least 2", attempts)
 	}
 }

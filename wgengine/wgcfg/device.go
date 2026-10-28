@@ -5,62 +5,48 @@ package wgcfg
 
 import (
 	"fmt"
-	"net/netip"
 
 	"github.com/tailscale/wireguard-go/conn"
 	"github.com/tailscale/wireguard-go/device"
 	"github.com/tailscale/wireguard-go/tun"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/clientmetric"
 )
 
 // NewDevice returns a wireguard-go Device configured for Tailscale use.
 func NewDevice(tunDev tun.Device, bind conn.Bind, logger *device.Logger) *device.Device {
-	ret := device.NewDevice(tunDev, bind, logger)
-	ret.DisableSomeRoamingForBrokenMobileSemantics()
-	return ret
+	return device.NewDevice(tunDev, bind, logger, append(getMemoryOptions(), getDeviceMetrics())...)
 }
 
-// ReconfigDevice replaces the existing device configuration with cfg.
-//
-// Instead of using the UAPI text protocol, it uses the wireguard-go direct API
-// to install a [device.PeerLookupFunc] callback that creates peers on demand.
-//
-// The caller is responsible for:
-//   - calling [device.Device.SetPrivateKey] when the key changes
-//   - installing a [device.PeerByIPPacketFunc] on the device for outbound
-//     packet routing (e.g. via [tailscale.com/wgengine.Engine.SetPeerByIPPacketFunc])
-func ReconfigDevice(d *device.Device, cfg *Config, logf logger.Logf) (err error) {
-	defer func() {
-		if err != nil {
-			logf("wgcfg.Reconfig failed: %v", err)
-		}
-	}()
-
-	// Build peer map: public key → allowed IPs.
-	peers := make(map[device.NoisePublicKey][]netip.Prefix, len(cfg.Peers))
-	for _, p := range cfg.Peers {
-		peers[p.PublicKey.Raw32()] = p.AllowedIPs
-	}
-
-	// Remove peers not in the new config.
-	d.RemoveMatchingPeers(func(pk device.NoisePublicKey) bool {
-		_, exists := peers[pk]
-		return !exists
+func getDeviceMetrics() device.Option {
+	return device.WithMetrics(device.Metrics{
+		MessageInitiationTXAttemptInitial: metricMessageInitiationTXAttemptInitial,
+		MessageInitiationTXAttemptRetry:   metricMessageInitiationTXAttemptRetry,
+		MessageResponseTXAttempt:          metricMessageResponseTXAttempt,
+		MessageCookieReplyTXAttempt:       metricMessageCookieReplyTXAttempt,
+		HandshakeInitiatorCompleted:       metricHandshakeInitiatorCompleted,
+		HandshakeResponderCompleted:       metricHandshakeResponderCompleted,
+		MessageTransportRXDroppedReplay:   metricMessageTransportRXDroppedReplay,
 	})
+}
 
-	// Update AllowedIPs on any already-active peers whose config may have
-	// changed. Peers that don't exist yet will get the correct AllowedIPs
-	// from PeerLookupFunc when they are lazily created.
-	for pk, allowedIPs := range peers {
-		if peer, ok := d.LookupActivePeer(pk); ok {
-			peer.SetAllowedIPs(allowedIPs)
-		}
-	}
+var (
+	metricMessageInitiationTXAttemptInitial = clientmetric.NewCounter("wireguard_message_initiation_tx_attempt_initial")
+	metricMessageInitiationTXAttemptRetry   = clientmetric.NewCounter("wireguard_message_initiation_tx_attempt_retry")
+	metricMessageResponseTXAttempt          = clientmetric.NewCounter("wireguard_message_response_tx_attempt")
+	metricMessageCookieReplyTXAttempt       = clientmetric.NewCounter("wireguard_message_cookie_reply_tx_attempt")
+	metricHandshakeInitiatorCompleted       = clientmetric.NewCounter("wireguard_handshake_initiator_completed")
+	metricHandshakeResponderCompleted       = clientmetric.NewCounter("wireguard_handshake_responder_completed")
+	metricMessageTransportRXDroppedReplay   = clientmetric.NewCounter("wireguard_message_transport_rx_dropped_replay")
+)
 
-	// Install callback for lazy peer creation (incoming packets).
-	bind := d.Bind()
-	d.SetPeerLookupFunc(func(pubk device.NoisePublicKey) (_ *device.NewPeerConfig, ok bool) {
-		allowedIPs, ok := peers[pubk]
+// NewPeerLookupFunc returns a [device.PeerLookupFunc] that lazily
+// creates peers using peerConfig as the source of each peer's allowed IPs and
+// optional pre-shared key. The peer's endpoint is derived from its public key
+// via bind.
+func NewPeerLookupFunc(bind conn.Bind, logf logger.Logf, peerConfig func(device.NoisePublicKey) (PeerConfig, bool)) device.PeerLookupFunc {
+	return func(pubk device.NoisePublicKey) (_ *device.NewPeerConfig, ok bool) {
+		conf, ok := peerConfig(pubk)
 		if !ok {
 			return nil, false
 		}
@@ -70,18 +56,9 @@ func ReconfigDevice(d *device.Device, cfg *Config, logf logger.Logf) (err error)
 			return nil, false
 		}
 		return &device.NewPeerConfig{
-			AllowedIPs: allowedIPs,
-			Endpoint:   ep,
+			AllowedIPs:   conf.AllowedIPs,
+			PresharedKey: conf.PresharedKey,
+			Endpoint:     ep,
 		}, true
-	})
-
-	// RemoveMatchingPeers _again_, now that SetPeerLookupFunc is installed,
-	// lest any removed peers got re-created before the new SetPeerLookupFunc
-	// func was installed.
-	d.RemoveMatchingPeers(func(pk device.NoisePublicKey) bool {
-		_, exists := peers[pk]
-		return !exists
-	})
-
-	return nil
+	}
 }

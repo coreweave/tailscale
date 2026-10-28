@@ -23,7 +23,7 @@ func CheckDERPHeuristicTimes(t *testing.T) {
 
 func TestForceSetNearestDERP(t *testing.T) {
 	derpMap := &tailcfg.DERPMap{
-		Regions: map[int]*tailcfg.DERPRegion{
+		Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{
 			7: {
 				RegionID:   7,
 				RegionCode: "test",
@@ -77,7 +77,7 @@ func TestForceSetNearestDERP(t *testing.T) {
 
 func TestSetDERPMapDoReStun(t *testing.T) {
 	derpMap1 := &tailcfg.DERPMap{
-		Regions: map[int]*tailcfg.DERPRegion{
+		Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{
 			1: {
 				RegionID:   1,
 				RegionCode: "cph",
@@ -88,7 +88,7 @@ func TestSetDERPMapDoReStun(t *testing.T) {
 		},
 	}
 	derpMap2 := &tailcfg.DERPMap{
-		Regions: map[int]*tailcfg.DERPRegion{
+		Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{
 			2: {
 				RegionID:   2,
 				RegionCode: "inc",
@@ -106,7 +106,9 @@ func TestSetDERPMapDoReStun(t *testing.T) {
 
 	bus := eventbustest.NewBus(t)
 	ht := health.NewTracker(bus)
-	c := newConn(t.Logf)
+	// Use WhileTestRunningLogger so the goroutine spawned by setDERPMap
+	// (which calls ReSTUN, which logs) doesn't race with test cleanup.
+	c := newConn(tstest.WhileTestRunningLogger(t))
 	ec := bus.Client("magicsock.Conn.Test")
 	c.eventClient = ec
 	c.homeDERPChangedPub = eventbus.Publish[HomeDERPChanged](ec)

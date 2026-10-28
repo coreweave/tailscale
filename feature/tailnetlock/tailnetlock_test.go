@@ -22,15 +22,12 @@ func TestHandleC2NDebugTKA(t *testing.T) {
 			return nil, nil
 		}
 
-		disablementSecret := bytes.Repeat([]byte{0xa5}, 32)
 		signerKey := key.NewNLPrivate()
 		key1 := tka.Key{Kind: tka.Key25519, Public: signerKey.Public().Verifier(), Votes: 2}
+		state := tka.CreateStateForTest(key1)
 
 		chonk := tka.ChonkMem()
-		authority, _, err := tka.Create(chonk, tka.State{
-			Keys:              []tka.Key{key1},
-			DisablementValues: [][]byte{tka.DisablementKDF(disablementSecret)},
-		}, signerKey)
+		authority, _, err := tka.Create(chonk, state, signerKey)
 		if err != nil {
 			t.Fatalf("tka.Create() failed: %v", err)
 		}
@@ -60,7 +57,7 @@ func TestHandleC2NDebugTKA(t *testing.T) {
 		return sb.String()
 	}
 
-	// matches [jsonoutput.PrintNetworkLockLogJSONV1]
+	// matches [jsonoutput.PrintTailnetLockLogJSONV1]
 	type response struct {
 		SchemaVersion string
 		Messages      []any
@@ -71,7 +68,7 @@ func TestHandleC2NDebugTKA(t *testing.T) {
 
 		req := httptest.NewRequest("GET", "/debug/tka/log", nil)
 		rec := httptest.NewRecorder()
-		b.HandleC2NForTest(rec, req)
+		b.ForTest().HandleC2N(rec, req)
 
 		if rec.Code != 400 {
 			t.Fatalf("got status code: %v, want: 400\nBody: %s", rec.Code, rec.Body)
@@ -84,7 +81,7 @@ func TestHandleC2NDebugTKA(t *testing.T) {
 
 		req := httptest.NewRequest("GET", "/debug/tka/log", nil)
 		rec := httptest.NewRecorder()
-		b.HandleC2NForTest(rec, req)
+		b.ForTest().HandleC2N(rec, req)
 
 		if rec.Code != 200 {
 			t.Fatalf("got status code: %v, want: 200\nBody: %s", rec.Code, bodyHead(rec.Body))
@@ -106,7 +103,7 @@ func TestHandleC2NDebugTKA(t *testing.T) {
 
 		req := httptest.NewRequest("GET", "/debug/tka/log", nil)
 		rec := httptest.NewRecorder()
-		b.HandleC2NForTest(rec, req)
+		b.ForTest().HandleC2N(rec, req)
 
 		if rec.Code != 200 {
 			t.Fatalf("got status code: %v, want: 200\nBody: %s", rec.Code, bodyHead(rec.Body))
@@ -128,7 +125,7 @@ func TestHandleC2NDebugTKA(t *testing.T) {
 
 		req := httptest.NewRequest("GET", "/debug/tka/log?limit=60", nil)
 		rec := httptest.NewRecorder()
-		b.HandleC2NForTest(rec, req)
+		b.ForTest().HandleC2N(rec, req)
 
 		if rec.Code != 200 {
 			t.Fatalf("got status code: %v, want: 200\nBody: %s", rec.Code, bodyHead(rec.Body))

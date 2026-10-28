@@ -6,7 +6,7 @@ package helloserver
 
 import (
 	"crypto/tls"
-	_ "embed"
+	"embed"
 	"html/template"
 	"log"
 	"net/http"
@@ -16,10 +16,16 @@ import (
 	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 )
 
 //go:embed hello.tmpl.html
 var embeddedTemplate string
+
+//go:embed static/*
+var staticFiles embed.FS
+
+var staticHandler = http.FileServerFS(staticFiles)
 
 var tmpl = template.Must(template.New("home").Parse(embeddedTemplate))
 
@@ -89,7 +95,7 @@ func tailscaleIP(who *apitype.WhoIsResponse) string {
 	if who == nil {
 		return ""
 	}
-	vals, err := tailcfg.UnmarshalNodeCapJSON[string](who.Node.CapMap, tailcfg.NodeAttrNativeIPV4)
+	vals, err := tailcfg.UnmarshalNodeCapJSON[string](who.Node.CapMap, nodecap.NativeIPV4)
 	if err == nil && len(vals) > 0 {
 		return vals[0]
 	}
@@ -116,6 +122,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "https://"+host, http.StatusFound)
 		return
 	}
+
+	if strings.HasPrefix(r.RequestURI, "/static/") {
+		staticHandler.ServeHTTP(w, r)
+		return
+	}
+
 	if r.RequestURI != "/" {
 		http.Redirect(w, r, "/", http.StatusFound)
 		return

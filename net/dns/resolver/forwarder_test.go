@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"os"
 	"reflect"
 	"slices"
 	"strings"
@@ -23,11 +24,13 @@ import (
 	dns "golang.org/x/net/dns/dnsmessage"
 	"tailscale.com/control/controlknobs"
 	"tailscale.com/health"
+	"tailscale.com/net/dns/publicdns"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/tstest"
 	"tailscale.com/types/dnstype"
 	"tailscale.com/util/dnsname"
+	"tailscale.com/util/eventbus"
 	"tailscale.com/util/eventbus/eventbustest"
 )
 
@@ -144,9 +147,19 @@ func TestResolversWithDelays(t *testing.T) {
 			want: o("https://dns.nextdns.io/c3a884"),
 		},
 		{
-			name: "controld-ipv6-expand",
+			// ID-encoded Control D addresses are legacy port-53-only
+			// endpoints (see #20433); they must not be upgraded to DoH and
+			// instead pass through as ordinary port-53 resolvers.
+			name: "controld-ipv6-id-encoded-not-doh",
 			in:   q("2606:1a40:0:6:7b5b:5949:35ad:0"),
-			want: o("https://dns.controld.com/hyq3ipr2ct"),
+			want: o("2606:1a40:0:6:7b5b:5949:35ad:0"),
+		},
+		{
+			// The free anycast resolvers (freedns.controld.com/pN) do serve
+			// DoH and are upgraded.
+			name: "controld-free-anycast-doh",
+			in:   q("2606:1a40::1"),
+			want: o("https://freedns.controld.com/p1", "2606:1a40::1+0.5s"),
 		},
 		{
 			name: "controld-doh-input",
@@ -226,6 +239,84 @@ func TestGetKnownDoHClientForProvider(t *testing.T) {
 	t.Logf("Got: %+v", res)
 }
 
+// TestControlDPremiumDoHLive exercises the real DoH dial path against Control D's
+// live infrastructure for a premium resolver, to confirm end-to-end that we use
+// reachable DoH endpoints (see ESC-30: we previously synthesized per-resolver
+// IPv6 addresses that only speak plaintext DNS on port 53 and refuse :443).
+//
+// It is disabled by default and only runs when TS_TEST_CONTROLD_RESOLVER_ID is
+// set to a Control D premium resolver ID (the path component of a
+// https://dns.controld.com/<id> DoH URL). For example:
+//
+//	TS_TEST_CONTROLD_RESOLVER_ID=abc123 go test ./net/dns/resolver/ \
+//	    -run TestControlDPremiumDoHLive -v
+//
+// To reproduce the pre-fix failure, temporarily revert DoHIPsOfBase to return
+// the controlDv6Gen-synthesized addresses: on an IPv6-only network this test
+// then fails with a connection error instead of a successful response.
+func TestControlDPremiumDoHLive(t *testing.T) {
+	id := os.Getenv("TS_TEST_CONTROLD_RESOLVER_ID")
+	if id == "" {
+		t.Skip("set TS_TEST_CONTROLD_RESOLVER_ID=<premium resolver id> to run")
+	}
+
+	logf := tstest.WhileTestRunningLogger(t)
+	bus := eventbustest.NewBus(t)
+	netMon, err := netmon.New(bus, logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dialer tsdial.Dialer
+	dialer.SetNetMon(netMon)
+	dialer.SetBus(bus)
+	fwd := newForwarder(logf, netMon, nil, &dialer, health.NewTracker(bus), nil)
+
+	urlBase := "https://dns.controld.com/" + id
+	c, ok := fwd.getKnownDoHClientForProvider(urlBase)
+	if !ok {
+		t.Fatalf("no known DoH client for %q", urlBase)
+	}
+	t.Logf("dialing DoH IPs: %v", publicdns.DoHIPsOfBase(urlBase))
+
+	// Build an A query for example.com.
+	builder := dns.NewBuilder(nil, dns.Header{RecursionDesired: true})
+	builder.StartQuestions()
+	if err := builder.Question(dns.Question{
+		Name:  dns.MustNewName("example.com."),
+		Type:  dns.TypeA,
+		Class: dns.ClassINET,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	query, err := builder.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	res, err := fwd.sendDoH(ctx, urlBase, c, query)
+	if err != nil {
+		t.Fatalf("sendDoH: %v", err)
+	}
+	if rcode := getRCode(res); rcode != dns.RCodeSuccess {
+		t.Fatalf("got rcode %v, want success", rcode)
+	}
+
+	var p dns.Parser
+	if _, err := p.Start(res); err != nil {
+		t.Fatalf("parsing response: %v", err)
+	}
+	if err := p.SkipAllQuestions(); err != nil {
+		t.Fatalf("skipping questions: %v", err)
+	}
+	if _, err := p.AnswerHeader(); err != nil {
+		t.Fatalf("no answers returned: %v", err)
+	}
+	t.Logf("ControlD premium DoH query for example.com succeeded (%d bytes)", len(res))
+}
+
 func BenchmarkNameFromQuery(b *testing.B) {
 	builder := dns.NewBuilder(nil, dns.Header{})
 	builder.StartQuestions()
@@ -246,64 +337,6 @@ func BenchmarkNameFromQuery(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
-}
-
-// Reproduces https://github.com/tailscale/tailscale/issues/2533
-// Fixed by https://github.com/tailscale/tailscale/commit/f414a9cc01f3264912513d07c0244ff4f3e4ba54
-//
-// NOTE: fuzz tests act like unit tests when run without `-fuzz`
-func FuzzClampEDNSSize(f *testing.F) {
-	// Empty DNS packet
-	f.Add([]byte{
-		// query id
-		0x12, 0x34,
-		// flags: standard query, recurse
-		0x01, 0x20,
-		// num questions
-		0x00, 0x00,
-		// num answers
-		0x00, 0x00,
-		// num authority RRs
-		0x00, 0x00,
-		// num additional RRs
-		0x00, 0x00,
-	})
-
-	// Empty OPT
-	f.Add([]byte{
-		// header
-		0xaf, 0x66, 0x01, 0x20, 0x00, 0x01, 0x00, 0x00,
-		0x00, 0x00, 0x00, 0x01,
-		// query
-		0x06, 0x67, 0x6f, 0x6f, 0x67, 0x6c, 0x65, 0x03, 0x63, 0x6f,
-		0x6d, 0x00, 0x00, 0x01, 0x00, 0x01,
-		// OPT
-		0x00,       // name: <root>
-		0x00, 0x29, // type: OPT
-		0x10, 0x00, // UDP payload size
-		0x00,       // higher bits in extended RCODE
-		0x00,       // EDNS0 version
-		0x80, 0x00, // "Z" field
-		0x00, 0x00, // data length
-	})
-
-	// Query for "google.com"
-	f.Add([]byte{
-		// header
-		0xaf, 0x66, 0x01, 0x20, 0x00, 0x01, 0x00, 0x00,
-		0x00, 0x00, 0x00, 0x01,
-		// query
-		0x06, 0x67, 0x6f, 0x6f, 0x67, 0x6c, 0x65, 0x03, 0x63, 0x6f,
-		0x6d, 0x00, 0x00, 0x01, 0x00, 0x01,
-		// OPT
-		0x00, 0x00, 0x29, 0x10, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00,
-		0x0c, 0x00, 0x0a, 0x00, 0x08, 0x62, 0x18, 0x1a, 0xcb, 0x19,
-		0xd7, 0xee, 0x23,
-	})
-
-	f.Fuzz(func(t *testing.T, data []byte) {
-		clampEDNSSize(data, maxResponseBytes)
-	})
 }
 
 type testDNSServerOptions struct {
@@ -671,10 +704,7 @@ func makeResponseOfSize(tb testing.TB, domain string, targetSize int, includeOPT
 	if includeOPT {
 		baseSize += 11 // OPT record adds ~11 bytes
 	}
-	estimatedRecords := (targetSize - baseSize) / bytesPerRecord
-	if estimatedRecords < 1 {
-		estimatedRecords = 1
-	}
+	estimatedRecords := max((targetSize-baseSize)/bytesPerRecord, 1)
 
 	// Start with estimated records and adjust
 	txtLen := 200
@@ -741,10 +771,7 @@ func makeResponseOfSize(tb testing.TB, domain string, targetSize int, includeOPT
 			// If we need too many records, increase TXT length instead
 			txtLen = 255         // Max single TXT string length
 			bytesPerRecord = 280 // Adjusted estimate
-			estimatedRecords = (targetSize - baseSize) / bytesPerRecord
-			if estimatedRecords < 1 {
-				estimatedRecords = 1
-			}
+			estimatedRecords = max((targetSize-baseSize)/bytesPerRecord, 1)
 		}
 	}
 
@@ -1092,6 +1119,479 @@ func TestForwarderTCPFallbackError(t *testing.T) {
 	}
 }
 
+// TestForwarderIgnoresStrayDatagrams checks that a datagram that is not a
+// reply to the query in flight can neither answer the query nor end it. The
+// forwarder's upstream UDP socket is unconnected, so when reading a reply it
+// has to sort out datagrams from other sources: a spoofed reply from another
+// address carrying the query's transaction ID, a datagram from the resolver
+// with the wrong transaction ID, and a datagram too short to hold a DNS
+// header must all be ignored in favor of the resolver's real reply. A spoofed
+// reply with no real reply behind it must never be returned to the client.
+//
+// See tailscale/corp#48187.
+func TestForwarderIgnoresStrayDatagrams(t *testing.T) {
+	const domain = "stray-datagram.example.com."
+
+	// Use a nonzero query ID so that a real reply has to copy it from the
+	// query, and so that a stray datagram can carry an ID that doesn't
+	// match. The spoofed reply differs from the real one only in its
+	// answer address, so returning it is detectable.
+	const queryID = 0x1e5a
+	request := makeTestRequest(t, domain, dns.TypeA, 0)
+	binary.BigEndian.PutUint16(request[0:2], queryID)
+	realResponse := makeTestResponse(t, domain, dns.RCodeSuccess, netip.MustParseAddr("127.0.0.1"))
+	spoofedResponse := makeTestResponse(t, domain, dns.RCodeSuccess, netip.MustParseAddr("127.0.0.9"))
+	binary.BigEndian.PutUint16(realResponse[0:2], queryID)
+	binary.BigEndian.PutUint16(spoofedResponse[0:2], queryID)
+
+	tests := []struct {
+		name    string
+		onQuery func(resolver, spoofer *net.UDPConn, dst netip.AddrPort)
+		// wantNone is true when no reply should ever reach the client.
+		wantNone bool
+	}{
+		{
+			// A spoofed reply from some other source address, with
+			// the transaction ID of the query, then the real reply.
+			name: "wrong-source-right-txid",
+			onQuery: func(resolver, spoofer *net.UDPConn, dst netip.AddrPort) {
+				spoofer.WriteToUDPAddrPort(spoofedResponse, dst)
+				resolver.WriteToUDPAddrPort(realResponse, dst)
+			},
+		},
+		{
+			// A datagram from the resolver with the wrong
+			// transaction ID, then the real reply.
+			name: "right-source-wrong-txid",
+			onQuery: func(resolver, spoofer *net.UDPConn, dst netip.AddrPort) {
+				badTxID := append([]byte(nil), spoofedResponse...)
+				binary.BigEndian.PutUint16(badTxID[0:2], queryID+1)
+				resolver.WriteToUDPAddrPort(badTxID, dst)
+				resolver.WriteToUDPAddrPort(realResponse, dst)
+			},
+		},
+		{
+			// A datagram from the resolver too short to hold a DNS
+			// header, then the real reply.
+			name: "right-source-too-short",
+			onQuery: func(resolver, spoofer *net.UDPConn, dst netip.AddrPort) {
+				resolver.WriteToUDPAddrPort([]byte("not dns"), dst)
+				resolver.WriteToUDPAddrPort(realResponse, dst)
+			},
+		},
+		{
+			// A spoofed reply with the right transaction ID from a
+			// wrong source, and never a real reply.
+			name:     "wrong-source-right-txid-no-reply",
+			wantNone: true,
+			onQuery: func(resolver, spoofer *net.UDPConn, dst netip.AddrPort) {
+				spoofer.WriteToUDPAddrPort(spoofedResponse, dst)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// The resolver the forwarder queries, and a second socket
+			// standing in for a spoofer elsewhere on the network.
+			resolver, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resolver.Close()
+			spoofer, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer spoofer.Close()
+
+			// On each query, aim the subtest's datagrams at the
+			// forwarder's socket, whose address is the query's source.
+			go func() {
+				buf := make([]byte, 512)
+				for {
+					n, src, err := resolver.ReadFromUDPAddrPort(buf)
+					if err != nil {
+						return
+					}
+					if !bytes.Equal(buf[:n], request) {
+						t.Errorf("invalid request\ngot:  %+v\nwant: %+v", buf[:n], request)
+						return
+					}
+					tt.onQuery(resolver, spoofer, src)
+				}
+			}()
+
+			logf := tstest.WhileTestRunningLogger(t)
+			bus := eventbustest.NewBus(t)
+			netMon, err := netmon.New(bus, logf)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer netMon.Close()
+
+			var dialer tsdial.Dialer
+			dialer.SetNetMon(netMon)
+			dialer.SetBus(bus)
+
+			fwd := newForwarder(logf, netMon, nil, &dialer, health.NewTracker(bus), nil)
+
+			rpkt := packet{
+				bs:     request,
+				family: "udp",
+				addr:   netip.MustParseAddrPort("127.0.0.1:12345"),
+			}
+			rchan := make(chan packet, 1)
+
+			// When a reply is expected it should arrive promptly;
+			// when none is, the query only has to outlast the
+			// spoofed datagram.
+			timeout := 5 * time.Second
+			if tt.wantNone {
+				timeout = 500 * time.Millisecond
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			defer cancel()
+
+			resolverAddr, err := netip.ParseAddrPort(resolver.LocalAddr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := fwd.forwardWithDestChan(ctx, rpkt, rchan,
+				resolverAndDelay{name: &dnstype.Resolver{Addr: resolverAddr.String()}}); err != nil && !tt.wantNone {
+				t.Fatalf("forwardWithDestChan: %v", err)
+			}
+
+			select {
+			case res := <-rchan:
+				if tt.wantNone {
+					t.Fatalf("forwarder returned a reply anyway: %+v", res.bs)
+				}
+				if !bytes.Equal(res.bs, realResponse) {
+					t.Errorf("invalid response\ngot:  %+v\nwant: %+v", res.bs, realResponse)
+				}
+			case <-ctx.Done():
+				if !tt.wantNone {
+					t.Fatalf("timed out waiting for response: %v", ctx.Err())
+				}
+			}
+		})
+	}
+}
+
+// netstackUpstream is a resolver at a tailnet (CGNAT) address. In userspace
+// networking mode the host stack has no route to it; only netstack does.
+var netstackUpstream = netip.MustParseAddrPort("100.64.1.2:53")
+
+// netstackDialCounts records which netstack dial hooks the forwarder used.
+type netstackDialCounts struct {
+	udp, tcp atomic.Int64
+}
+
+// newNetstackDialer returns a [tsdial.Dialer] configured the way userspace
+// networking mode configures it: UseNetstackForIP reports true for the tailnet
+// upstream, and the netstack dial hooks are the only way to reach it.
+//
+// These are the same hooks cmd/tailscaled installs when onlyNetstack is set
+// (cmd/tailscaled/tailscaled.go, cmd/tailscaled/netstack.go) and that tsnet
+// installs in tsnet.go. Both hooks here redirect to peer, a real DNS server on
+// loopback standing in for the tailnet resolver, so a correctly-routed query
+// gets a real answer rather than a synthetic one.
+func newNetstackDialer(tb testing.TB, netMon *netmon.Monitor, bus *eventbus.Bus, peer netip.AddrPort) (*tsdial.Dialer, *netstackDialCounts) {
+	tb.Helper()
+	counts := new(netstackDialCounts)
+
+	d := &tsdial.Dialer{Logf: tstest.WhileTestRunningLogger(tb)}
+	d.SetNetMon(netMon)
+	d.SetBus(bus)
+	d.UseNetstackForIP = func(ip netip.Addr) bool {
+		return ip == netstackUpstream.Addr()
+	}
+	d.NetstackDialUDP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
+		counts.udp.Add(1)
+		var nd net.Dialer
+		return nd.DialContext(ctx, "udp4", peer.String())
+	}
+	d.NetstackDialTCP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
+		counts.tcp.Add(1)
+		var nd net.Dialer
+		return nd.DialContext(ctx, "tcp4", peer.String())
+	}
+	return d, counts
+}
+
+// TestForwarderNetstackUpstream checks that the forwarder reaches an upstream
+// resolver that is only routable through netstack — the userspace networking
+// case, where there is no tun device and so the host stack cannot reach the
+// tailnet.
+//
+// The two subtests send the same query to the same upstream and differ only in
+// the transport the forwarder picks; both must consult the dialer, so each
+// asserts on the netstack dial hook. The UDP subtest also bounds elapsed by
+// udpRaceTimeout, since a regression that silently falls back to TCP still
+// produces the right bytes, just two seconds late.
+//
+// See tailscale/tailscale#20314.
+func TestForwarderNetstackUpstream(t *testing.T) {
+	const domain = "netstack-upstream.example.com."
+	request := makeTestRequest(t, domain, dns.TypeA, 0)
+	response := makeTestResponse(t, domain, dns.RCodeSuccess, netip.MustParseAddr("127.0.0.1"))
+
+	for _, family := range []string{"tcp", "udp"} {
+		t.Run(family, func(t *testing.T) {
+			var sawUDP, sawTCP atomic.Bool
+			port := runDNSServer(t, nil, response, func(isTCP bool, gotRequest []byte) {
+				if isTCP {
+					sawTCP.Store(true)
+				} else {
+					sawUDP.Store(true)
+				}
+				if !bytes.Equal(request, gotRequest) {
+					t.Errorf("invalid request\ngot:  %+v\nwant: %+v", gotRequest, request)
+				}
+			})
+			peer := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), port)
+
+			logf := tstest.WhileTestRunningLogger(t)
+			bus := eventbustest.NewBus(t)
+			netMon, err := netmon.New(bus, logf)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer netMon.Close()
+
+			dialer, dials := newNetstackDialer(t, netMon, bus, peer)
+			fwd := newForwarder(logf, netMon, nil, dialer, health.NewTracker(bus), nil)
+			fwd.verboseFwd = true
+
+			rpkt := packet{
+				bs:     request,
+				family: family,
+				addr:   netip.MustParseAddrPort("127.0.0.1:12345"),
+			}
+			rchan := make(chan packet, 1)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			start := time.Now()
+			err = fwd.forwardWithDestChan(ctx, rpkt, rchan,
+				resolverAndDelay{name: &dnstype.Resolver{Addr: netstackUpstream.String()}})
+			if err != nil {
+				t.Fatalf("forwardWithDestChan: %v", err)
+			}
+			var got []byte
+			select {
+			case res := <-rchan:
+				got = res.bs
+			case <-ctx.Done():
+				t.Fatalf("timed out waiting for response: %v", ctx.Err())
+			}
+			elapsed := time.Since(start)
+			t.Logf("query took %v; netstack dials udp=%d tcp=%d; upstream saw udp=%v tcp=%v",
+				elapsed, dials.udp.Load(), dials.tcp.Load(), sawUDP.Load(), sawTCP.Load())
+
+			if !bytes.Equal(got, response) {
+				t.Errorf("invalid response\ngot:  %+v\nwant: %+v", got, response)
+			}
+
+			// The forwarder must reach the upstream over the netstack
+			// dialer for the family it was asked to use. Asserting on
+			// the dial hook rather than on latency alone keeps this
+			// meaningful on a host that blackholes CGNAT traffic (a
+			// default route) and on one that rejects it immediately.
+			if family == "udp" {
+				if dials.udp.Load() == 0 {
+					t.Errorf("forwarder never dialed UDP via netstack: the UDP path bypassed the dialer")
+				}
+				if !sawUDP.Load() {
+					t.Errorf("upstream never saw a UDP query")
+				}
+				if elapsed >= udpRaceTimeout {
+					t.Errorf("query took %v (>= udpRaceTimeout %v): UDP never answered and the response came from the TCP fallback",
+						elapsed, udpRaceTimeout)
+				}
+			} else if dials.tcp.Load() == 0 {
+				t.Errorf("forwarder never dialed TCP via netstack")
+			}
+		})
+	}
+}
+
+// TestForwarderNetstackUpstreamTruncated checks that an oversized response
+// from an upstream reached through netstack gets the TC flag, the same as one
+// from a host-stack socket.
+func TestForwarderNetstackUpstreamTruncated(t *testing.T) {
+	const domain = "large-netstack-upstream.example.com."
+	_, largeResponse := makeLargeResponse(t, domain)
+
+	// Advertise an EDNS buffer of maxResponseBytes, so that the TC flag can
+	// only come from read truncation and not from checkResponseSizeAndSetTC
+	// enforcing a smaller limit.
+	request := makeTestRequest(t, domain, dns.TypeA, maxResponseBytes)
+
+	var sawUDP, sawTCP atomic.Bool
+	port := runDNSServer(t, nil, largeResponse, func(isTCP bool, gotRequest []byte) {
+		if isTCP {
+			sawTCP.Store(true)
+		} else {
+			sawUDP.Store(true)
+		}
+		if !bytes.Equal(request, gotRequest) {
+			t.Errorf("invalid request\ngot:  %+v\nwant: %+v", gotRequest, request)
+		}
+	})
+	peer := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), port)
+
+	logf := tstest.WhileTestRunningLogger(t)
+	bus := eventbustest.NewBus(t)
+	netMon, err := netmon.New(bus, logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer netMon.Close()
+
+	dialer, dials := newNetstackDialer(t, netMon, bus, peer)
+	fwd := newForwarder(logf, netMon, nil, dialer, health.NewTracker(bus), nil)
+	fwd.verboseFwd = true
+	// Without this the forwarder retries over TCP and the client gets the
+	// whole response, as in [TestForwarderTCPFallbackDisabled].
+	setupForwarderWithTCPRetriesDisabled()(fwd)
+
+	rpkt := packet{
+		bs:     request,
+		family: "udp",
+		addr:   netip.MustParseAddrPort("127.0.0.1:12345"),
+	}
+	rchan := make(chan packet, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := fwd.forwardWithDestChan(ctx, rpkt, rchan,
+		resolverAndDelay{name: &dnstype.Resolver{Addr: netstackUpstream.String()}}); err != nil {
+		t.Fatalf("forwardWithDestChan: %v", err)
+	}
+	var got []byte
+	select {
+	case res := <-rchan:
+		got = res.bs
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for response: %v", ctx.Err())
+	}
+	t.Logf("netstack dials udp=%d tcp=%d; upstream saw udp=%v tcp=%v",
+		dials.udp.Load(), dials.tcp.Load(), sawUDP.Load(), sawTCP.Load())
+
+	want := append([]byte(nil), largeResponse[:maxResponseBytes]...)
+	setTCFlagInPacket(want)
+	if !bytes.Equal(got, want) {
+		t.Errorf("invalid response\ngot  (%d): %+v\nwant (%d): %+v", len(got), got, len(want), want)
+	}
+
+	if dials.udp.Load() != 1 {
+		t.Errorf("netstack UDP dials = %d, want 1", dials.udp.Load())
+	}
+	if dials.tcp.Load() != 0 {
+		t.Errorf("netstack TCP dials = %d, want 0 (TCP retries are disabled)", dials.tcp.Load())
+	}
+}
+
+// TestDialUDPDispatch checks that dialUDP uses netstack for an upstream
+// UseNetstackForIP claims, and a host-stack socket for everything else.
+func TestDialUDPDispatch(t *testing.T) {
+	publicUpstream := netip.MustParseAddrPort("8.8.8.8:53")
+
+	tests := []struct {
+		name         string
+		useNetstack  func(netip.Addr) bool
+		noDialUDP    bool // leave NetstackDialUDP nil
+		upstream     netip.AddrPort
+		wantNetstack bool
+		wantErr      bool
+	}{
+		{
+			name:     "no_hooks",
+			upstream: netstackUpstream,
+		},
+		{
+			name:        "hook_declines_public_upstream",
+			useNetstack: func(ip netip.Addr) bool { return ip == netstackUpstream.Addr() },
+			upstream:    publicUpstream,
+		},
+		{
+			name:         "hook_claims_tailnet_upstream",
+			useNetstack:  func(ip netip.Addr) bool { return ip == netstackUpstream.Addr() },
+			upstream:     netstackUpstream,
+			wantNetstack: true,
+		},
+		{
+			name:        "hook_claims_upstream_but_no_dialer",
+			useNetstack: func(netip.Addr) bool { return true },
+			noDialUDP:   true,
+			upstream:    netstackUpstream,
+			wantErr:     true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logf := tstest.WhileTestRunningLogger(t)
+			bus := eventbustest.NewBus(t)
+			netMon, err := netmon.New(bus, logf)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer netMon.Close()
+
+			// A UDP server that never replies: dialUDP only connects, so
+			// nothing here needs to answer.
+			pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer pc.Close()
+
+			var dialedNetstack bool
+			dialer := &tsdial.Dialer{Logf: logf}
+			dialer.SetNetMon(netMon)
+			dialer.SetBus(bus)
+			dialer.UseNetstackForIP = tt.useNetstack
+			if !tt.noDialUDP {
+				dialer.NetstackDialUDP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
+					dialedNetstack = true
+					var nd net.Dialer
+					return nd.DialContext(ctx, "udp4", pc.LocalAddr().String())
+				}
+			}
+			fwd := newForwarder(logf, netMon, nil, dialer, health.NewTracker(bus), nil)
+
+			conn, err := fwd.dialUDP(context.Background(), tt.upstream)
+			if tt.wantErr {
+				if err == nil {
+					conn.Close()
+					t.Fatal("dialUDP succeeded; want error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("dialUDP: %v", err)
+			}
+			defer conn.Close()
+
+			if dialedNetstack != tt.wantNetstack {
+				t.Errorf("dialed via netstack = %v, want %v", dialedNetstack, tt.wantNetstack)
+			}
+			if _, ok := conn.(*netstackPacketConn); ok != tt.wantNetstack {
+				t.Errorf("conn is *netstackPacketConn = %v, want %v", ok, tt.wantNetstack)
+			}
+			// The netstack conn is already connected, so check that sendUDP's
+			// addressed write still reaches it. The host path writes to a real
+			// upstream, which may legitimately fail here.
+			if _, err := conn.WriteToUDPAddrPort([]byte("hello"), tt.upstream); err != nil && tt.wantNetstack {
+				t.Errorf("WriteToUDPAddrPort: %v", err)
+			}
+		})
+	}
+}
+
 // Test to ensure that if we have more than one resolver, and at least one of them
 // returns a successful response, we propagate it.
 func TestForwarderWithManyResolvers(t *testing.T) {
@@ -1382,6 +1882,52 @@ func TestForwarderHealthOnContextExpiry(t *testing.T) {
 
 			if got := ht.IsUnhealthy(dnsForwarderFailing); got != tt.wantUnhealthy {
 				t.Errorf("IsUnhealthy = %v, want %v", got, tt.wantUnhealthy)
+			}
+		})
+	}
+}
+
+// TestForwarderHealthNoUpstreamResolvers verifies that a query with no upstream
+// resolver never raises dnsForwarderFailing, regardless of acceptDNS; that
+// warning is reserved for resolvers we found but couldn't reach (see
+// TestForwarderHealthOnContextExpiry). See tailscale/tailscale#19931.
+func TestForwarderHealthNoUpstreamResolvers(t *testing.T) {
+	const domain = "no-resolver.example.com."
+
+	for _, acceptDNS := range []bool{true, false} {
+		t.Run(fmt.Sprintf("acceptDNS=%v", acceptDNS), func(t *testing.T) {
+			request := makeTestRequest(t, domain, dns.TypeA, 0)
+			logf := tstest.WhileTestRunningLogger(t)
+			bus := eventbustest.NewBus(t)
+			netMon, err := netmon.New(bus, logf)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var dialer tsdial.Dialer
+			dialer.SetNetMon(netMon)
+			dialer.SetBus(bus)
+
+			ht := health.NewTracker(bus)
+			fwd := newForwarder(logf, netMon, nil, &dialer, ht, nil)
+			fwd.acceptDNS = acceptDNS
+			// No routes are configured, so the forwarder has no upstream
+			// resolver for the query and returns SERVFAIL.
+
+			rpkt := packet{
+				bs:     request,
+				family: "udp",
+				addr:   netip.MustParseAddrPort("127.0.0.1:12345"),
+			}
+			// Buffered so the SERVFAIL response can be sent without a reader.
+			responseChan := make(chan packet, 1)
+
+			if err := fwd.forwardWithDestChan(context.Background(), rpkt, responseChan); err != nil {
+				t.Fatalf("forwardWithDestChan: %v", err)
+			}
+
+			if ht.IsUnhealthy(dnsForwarderFailing) {
+				t.Error("dnsForwarderFailing was raised for a query with no upstream resolver; want healthy")
 			}
 		})
 	}

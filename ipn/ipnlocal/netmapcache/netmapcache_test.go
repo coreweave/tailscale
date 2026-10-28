@@ -23,6 +23,7 @@ import (
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"tailscale.com/ipn/ipnlocal/netmapcache"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/tka"
 	"tailscale.com/types/ipproto"
 	"tailscale.com/types/key"
@@ -119,12 +120,12 @@ func init() {
 			User:         30337,
 			Name:         "test.example.com.",
 			Key:          testNodeKey,
-			Capabilities: []tailcfg.NodeCapability{"cap1"},
-			CapMap: map[tailcfg.NodeCapability][]tailcfg.RawMessage{
+			Capabilities: []nodecap.Cap{"cap1"},
+			CapMap: map[nodecap.Cap][]tailcfg.RawMessage{
 				"cap2": nil,
 			},
 		}).View(),
-		AllCaps: set.Of[tailcfg.NodeCapability]("cap1", "cap2"),
+		AllCaps: set.Of[nodecap.Cap]("cap1", "cap2"),
 		NodeKey: testNodeKey,
 
 		DNS: tailcfg.DNSConfig{Domains: []string{"example1.com", "example2.ac.uk"}}, // "dns"
@@ -137,7 +138,7 @@ func init() {
 
 		DERPMap: &tailcfg.DERPMap{ // "derp"
 			HomeParams: &tailcfg.DERPHomeParams{
-				RegionScore: map[int]float64{10: 0.31, 20: 0.141, 30: 0.592},
+				RegionScore: map[tailcfg.DERPRegionID]float64{10: 0.31, 20: 0.141, 30: 0.592},
 			},
 			OmitDefaultRegions: true,
 		},
@@ -256,6 +257,119 @@ func TestInvalidCache(t *testing.T) {
 			t.Errorf("Load from invalid cache: got %+v, %v; want nil, %v", got, err, netmapcache.ErrCacheNotAvailable)
 		}
 	})
+}
+
+func TestUpdateSelfOnly(t *testing.T) {
+	s := make(testStore)
+	c := netmapcache.NewCache(s)
+
+	// Initialize the cache with the test map so we get a baseline.
+	if err := c.Store(t.Context(), testMap); err != nil {
+		t.Fatalf("Store initial netmap: %v", err)
+	}
+
+	// Modify a shallow copy of the map so we can perform an update and verify
+	// that it round-trips through a Load after calling UpdateSelfOnly.
+	newSelf := &tailcfg.Node{
+		ID:           23456,
+		StableID:     "n23456FAKE",
+		User:         8675309,
+		Name:         "alt.example.com.",
+		Key:          testNodeKey,
+		HomeDERP:     6174,
+		Capabilities: []nodecap.Cap{"cap1", "cap3"},
+	}
+	updated := *testMap // shallow copy
+	updated.SelfNode = newSelf.View()
+	updated.AllCaps = set.Of[nodecap.Cap]("cap1", "cap3")
+	updated.DNS = tailcfg.DNSConfig{Domains: []string{"example3.org", "example4.horse"}}
+
+	// Empty the peers and profiles so that we can verify the update does not
+	// attempt to use them or GC based on their absence.
+	updated.Peers = nil
+	updated.UserProfiles = nil
+
+	if err := c.UpdateSelfOnly(t.Context(), &updated); err != nil {
+		t.Fatalf("UpdateSelfOnly failed: %v", err)
+	}
+
+	// Verify we got the same results back. Importantly, we expect the same
+	// peers and profiles as before, to enforce that the self-only update did
+	// not prune
+	updated.Peers = testMap.Peers
+	updated.UserProfiles = testMap.UserProfiles
+
+	got, err := c.Load(t.Context())
+	if err != nil {
+		t.Fatalf("Load netmap failed: %v", err)
+	}
+	if diff := diffNetMaps(got, &updated); diff != "" {
+		t.Fatalf("Updated map differs (-got, +want):\n%s", diff)
+	}
+}
+
+func TestUpdatePeers(t *testing.T) {
+	modNode1 := (&tailcfg.Node{
+		ID:       99001,
+		StableID: "n99001FAKE",
+		Name:     "test1altered.example.com.",
+	}).View() // a modified version of testNode1
+	newNode3 := (&tailcfg.Node{
+		ID:       99003,
+		StableID: "n99003FAKE",
+		Name:     "test3.example.com.",
+	}).View() // a new node hitherto unseen
+
+	update := []tailcfg.NodeView{newNode3, modNode1}
+	remove := []tailcfg.StableNodeID{testNode2.StableID()}
+
+	// Modify a shallow copy of the map so we can perform an update and verify
+	// that it round-trips through a Load after calling UpdatePeers.
+	updated := *testMap
+	updated.Peers = []tailcfg.NodeView{modNode1, newNode3} // N.B. sorted
+
+	s := make(testStore)
+	c := netmapcache.NewCache(s)
+
+	// Prior to storing anything, the cache should reject an update because it
+	// has no base netmap to apply changes to.
+	if err := c.UpdatePeers(t.Context(), update, remove); err == nil {
+		t.Error("UpdatePeers on empty cache unexpectedly succeeded")
+	} else {
+		t.Logf("UpdatePeers on empty cache: %v (OK)", err)
+	}
+
+	// Initialize the cache with the test map so we get a baseline.
+	if err := c.Store(t.Context(), testMap); err != nil {
+		t.Fatalf("Store initial netmap: %v", err)
+	}
+
+	if err := c.UpdatePeers(t.Context(), update, remove); err != nil {
+		t.Fatalf("UpdatePeers failed; %v", err)
+	}
+
+	got, err := c.Load(t.Context())
+	if err != nil {
+		t.Fatalf("Load netmap failed: %v", err)
+	}
+	if diff := diffNetMaps(got, &updated); diff != "" {
+		t.Fatalf("Updated map differs (-got, +want):\n%s", diff)
+	}
+
+	// If we re-apply a previously-removed change, it should be persisted.
+	// See tailscale/tailscale#20795.
+	if err := c.UpdatePeers(t.Context(), []tailcfg.NodeView{testNode2}, nil); err != nil {
+		t.Errorf("UpdatePeers restoring an old peer: %v", err)
+	}
+
+	got2, err := c.Load(t.Context())
+	if err != nil {
+		t.Fatalf("Load netmap failed: %v", err)
+	}
+	updated.Peers = []tailcfg.NodeView{modNode1, testNode2, newNode3} // N.B. sorted
+	if diff := diffNetMaps(got2, &updated); diff != "" {
+		t.Fatalf("Updated map differs (-got, +want):\n%s", diff)
+	}
 }
 
 // skippedMapFields are the names of fields that should not be considered by

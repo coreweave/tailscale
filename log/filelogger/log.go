@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"tailscale.com/tstime"
 	"tailscale.com/types/logger"
 )
 
@@ -24,17 +25,17 @@ const (
 	maxFiles = 50
 )
 
-// New returns a logf wrapper that appends to local disk log
-// files on Windows, rotating old log files as needed to stay under
-// file count & byte limits.
-func New(fileBasePrefix, logID string, logf logger.Logf) logger.Logf {
+// New returns a logf wrapper that appends to local disk log files in dir on
+// Windows, creating dir if needed and rotating old log files as needed to
+// stay under file count & byte limits. If dir can't be created, it logs
+// that and returns logf unchanged.
+func New(dir, fileBasePrefix, logID string, logf logger.Logf) logger.Logf {
 	if runtime.GOOS != "windows" {
 		panic("not yet supported on any platform except Windows")
 	}
 	if logf == nil {
 		panic("nil logf")
 	}
-	dir := filepath.Join(os.Getenv("ProgramData"), "Tailscale", "Logs")
 
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		log.Printf("failed to create local log directory; not writing logs to disk: %v", err)
@@ -106,13 +107,8 @@ func (w *logFileWriter) appendToFileLocked(out []byte) {
 	}
 	out = removeDatePrefix(out)
 	if w.f != nil {
-		// RFC3339Nano but with a fixed number (3) of nanosecond digits:
-		const formatPre = "2006-01-02T15:04:05"
-		const formatPost = "Z07:00"
-		fmt.Fprintf(w.f, "%s.%03d%s: %s",
-			now.Format(formatPre),
-			now.Nanosecond()/int(time.Millisecond/time.Nanosecond),
-			now.Format(formatPost),
+		fmt.Fprintf(w.f, "%s: %s",
+			now.Format(tstime.DateTTimeMilliZ),
 			out)
 	}
 }

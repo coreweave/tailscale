@@ -46,6 +46,19 @@ func TestRelayManagerInitAndIdle(t *testing.T) {
 	<-rm.runLoopStoppedCh
 }
 
+// TestRelayManagerZeroServerDisco verifies that a [disco.CallMeMaybeVia] with
+// a zero ServerDisco is dropped rather than crashing the process in
+// [relayManager.ensureDiscoInfoFor]'s DiscoPrivate.Shared call, which rejects
+// zero keys. A malicious peer can zero the key, or send an unknown message
+// version, which parses to a zero-valued message.
+func TestRelayManagerZeroServerDisco(t *testing.T) {
+	rm := relayManager{}
+	c := &Conn{logf: t.Logf}
+	c.discoAtomic.Set(key.NewDisco())
+	rm.handleCallMeMaybeVia(&endpoint{c: c}, addrQuality{}, false, &disco.CallMeMaybeVia{})
+	<-rm.runLoopStoppedCh
+}
+
 func TestRelayManagerHandleDERPHomeChange(t *testing.T) {
 	rm := relayManager{}
 	servers := make(set.Set[candidatePeerRelay], 1)
@@ -109,12 +122,36 @@ func TestRelayManager_handleNewServerEndpointRunLoop(t *testing.T) {
 	serverDiscoA := key.NewDisco().Public()
 	serverDiscoB := key.NewDisco().Public()
 
+	// getAddrQuality returns an addrQuality with serverDisco with the provided
+	// VNI set. A negative vni leaves the VNI unset.
+	getAddrQuality := func(serverDisco key.DiscoPublic, vni int) addrQuality {
+		aq := addrQuality{relayServerDisco: serverDisco}
+		if vni >= 0 {
+			aq.epAddr.vni.Set(uint32(vni))
+		}
+		return aq
+	}
+
 	serverAendpointALamport1VNI1 := newRelayServerEndpointEvent{
 		wlb: endpointWithLastBest{ep: epA},
 		se:  udprelay.ServerEndpoint{ServerDisco: serverDiscoA, LamportID: 1, VNI: 1},
 	}
+	// lastBest matches the new server endpoint on both server disco and VNI, and
+	// is trusted: suppression should fire.
 	serverAendpointALamport1VNI1LastBestMatching := newRelayServerEndpointEvent{
-		wlb: endpointWithLastBest{ep: epA, lastBestIsTrusted: true, lastBest: addrQuality{relayServerDisco: serverDiscoA}},
+		wlb: endpointWithLastBest{ep: epA, lastBestIsTrusted: true, lastBest: getAddrQuality(serverDiscoA, 1)},
+		se:  udprelay.ServerEndpoint{ServerDisco: serverDiscoA, LamportID: 1, VNI: 1},
+	}
+	// lastBest matches the new server endpoint on server disco but NOT VNI (1 vs
+	// 2), and is trusted: suppression should NOT fire.
+	serverAendpointALamport1VNI1LastBestMatchingServerNeqVNI := newRelayServerEndpointEvent{
+		wlb: endpointWithLastBest{ep: epA, lastBestIsTrusted: true, lastBest: getAddrQuality(serverDiscoA, 2)},
+		se:  udprelay.ServerEndpoint{ServerDisco: serverDiscoA, LamportID: 1, VNI: 1},
+	}
+	// lastBest matches the new server endpoint on server disco, is trusted, but
+	// has no VNI set: suppression should NOT fire.
+	serverAendpointALamport1VNI1LastBestMatchingServerUnsetVNI := newRelayServerEndpointEvent{
+		wlb: endpointWithLastBest{ep: epA, lastBestIsTrusted: true, lastBest: getAddrQuality(serverDiscoA, -1)},
 		se:  udprelay.ServerEndpoint{ServerDisco: serverDiscoA, LamportID: 1, VNI: 1},
 	}
 	serverAendpointALamport2VNI1 := newRelayServerEndpointEvent{
@@ -212,11 +249,37 @@ func TestRelayManager_handleNewServerEndpointRunLoop(t *testing.T) {
 			},
 		},
 		{
-			name: "trusted-last-best-with-matching-server",
+			// Trusted lastBest matching on both server disco and VNI suppresses
+			// the new handshake.
+			name: "trusted-last-best-matching-server-and-vni",
 			events: []newRelayServerEndpointEvent{
 				serverAendpointALamport1VNI1LastBestMatching,
 			},
 			want: []newRelayServerEndpointEvent{},
+		},
+		{
+			// Trusted lastBest matching on server disco but NOT VNI must not
+			// suppress the new handshake, otherwise we may never handshake a new
+			// peer relay server endpoint around remote client restarts and/or
+			// disco key rotation (#20215).
+			name: "trusted-last-best-matching-server-neq-vni",
+			events: []newRelayServerEndpointEvent{
+				serverAendpointALamport1VNI1LastBestMatchingServerNeqVNI,
+			},
+			want: []newRelayServerEndpointEvent{
+				serverAendpointALamport1VNI1LastBestMatchingServerNeqVNI,
+			},
+		},
+		{
+			// Trusted lastBest matching on server disco with an unset VNI must
+			// not suppress the new handshake.
+			name: "trusted-last-best-matching-server-unset-vni",
+			events: []newRelayServerEndpointEvent{
+				serverAendpointALamport1VNI1LastBestMatchingServerUnsetVNI,
+			},
+			want: []newRelayServerEndpointEvent{
+				serverAendpointALamport1VNI1LastBestMatchingServerUnsetVNI,
+			},
 		},
 	}
 	for _, tt := range tests {

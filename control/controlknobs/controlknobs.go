@@ -12,6 +12,7 @@ import (
 
 	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/types/opt"
 )
 
@@ -25,7 +26,7 @@ type Knobs struct {
 	// the client port.
 	RandomizeClientPort atomic.Bool
 
-	// OneCGNAT is whether the the node should make one big CGNAT route
+	// OneCGNAT is whether the node should make one big CGNAT route
 	// in the OS rather than one /32 per peer.
 	OneCGNAT syncs.AtomicValue[opt.Bool]
 
@@ -110,6 +111,43 @@ type Knobs struct {
 	// See https://github.com/tailscale/tailscale/issues/15404.
 	// TODO(bradfitz): remove this a few releases after 2026-02-16.
 	ForceRegisterMagicDNSIPv4Only atomic.Bool
+
+	// EmitRuntimeMetrics is whether the node should poll and emit [runtime/metrics]
+	// as [tailscale.com/util/clientmetric]'s.
+	EmitRuntimeMetrics atomic.Bool
+
+	// DisableUDPGRO disables UDP GRO on the magicsock UDP socket. See
+	// [tailcfg.NodeAttrDisableUDPGRO].
+	DisableUDPGRO atomic.Bool
+
+	// DisableUDPGSO disables UDP GSO on the magicsock UDP socket. See
+	// [tailcfg.NodeAttrDisableUDPGSO].
+	DisableUDPGSO atomic.Bool
+
+	// DisableTUNUDPGRO disables UDP GRO on the Tailscale TUN device. See
+	// [tailcfg.NodeAttrDisableTUNUDPGRO].
+	DisableTUNUDPGRO atomic.Bool
+
+	// DisableTUNTCPGRO disables TCP GRO on the Tailscale TUN device. See
+	// [tailcfg.NodeAttrDisableTUNTCPGRO].
+	DisableTUNTCPGRO atomic.Bool
+
+	// NeverGSOEqualTail enables a UDP GSO sentinel-tail workaround in the
+	// underlay UDP packet TX path on Linux. Applies to magicsock and peer relay
+	// UDP sockets. See [tailcfg.NodeAttrNeverGSOEqualTail].
+	NeverGSOEqualTail atomic.Bool
+
+	// CacheNetworkMaps is whether the node should persistently cache network
+	// maps and use them to establish peer connectivity on start, if doing so
+	// is supported by the client and storage is available.
+	CacheNetworkMaps atomic.Bool
+
+	// ScopeQuad100OnMacOS lets sandboxed macOS scope quad-100 for simple DNS
+	// configs, so public queries can use the OS resolver (including DoH).
+	// Custom split resolvers or unrouted forward/PTR records still require
+	// quad-100 as primary. Off by default; has no effect on other platforms.
+	// See tailscale/corp#45534 and tailscale/corp#48693.
+	ScopeQuad100OnMacOS atomic.Bool
 }
 
 // UpdateFromNodeAttributes updates k (if non-nil) based on the provided self
@@ -120,30 +158,38 @@ func (k *Knobs) UpdateFromNodeAttributes(capMap tailcfg.NodeCapMap) {
 	}
 	has := capMap.Contains
 	var (
-		disableUPnP                          = has(tailcfg.NodeAttrDisableUPnP)
-		randomizeClientPort                  = has(tailcfg.NodeAttrRandomizeClientPort)
-		disableDeltaUpdates                  = has(tailcfg.NodeAttrDisableDeltaUpdates)
+		disableUPnP                          = has(nodecap.DisableUPnP)
+		randomizeClientPort                  = has(nodecap.RandomizeClientPort)
+		disableDeltaUpdates                  = has(nodecap.DisableDeltaUpdates)
 		oneCGNAT                             opt.Bool
-		forceBackgroundSTUN                  = has(tailcfg.NodeAttrDebugForceBackgroundSTUN)
-		peerMTUEnable                        = has(tailcfg.NodeAttrPeerMTUEnable)
-		dnsForwarderDisableTCPRetries        = has(tailcfg.NodeAttrDNSForwarderDisableTCPRetries)
-		silentDisco                          = has(tailcfg.NodeAttrSilentDisco)
-		forceIPTables                        = has(tailcfg.NodeAttrLinuxMustUseIPTables)
-		forceNfTables                        = has(tailcfg.NodeAttrLinuxMustUseNfTables)
-		probeUDPLifetime                     = has(tailcfg.NodeAttrProbeUDPLifetime)
-		appCStoreRoutes                      = has(tailcfg.NodeAttrStoreAppCRoutes)
-		userDialUseRoutes                    = has(tailcfg.NodeAttrUserDialUseRoutes)
-		disableSplitDNSWhenNoCustomResolvers = has(tailcfg.NodeAttrDisableSplitDNSWhenNoCustomResolvers)
-		disableLocalDNSOverrideViaNRPT       = has(tailcfg.NodeAttrDisableLocalDNSOverrideViaNRPT)
-		disableCaptivePortalDetection        = has(tailcfg.NodeAttrDisableCaptivePortalDetection)
-		disableSkipStatusQueue               = has(tailcfg.NodeAttrDisableSkipStatusQueue)
-		disableHostsFileUpdates              = has(tailcfg.NodeAttrDisableHostsFileUpdates)
-		forceRegisterMagicDNSIPv4Only        = has(tailcfg.NodeAttrForceRegisterMagicDNSIPv4Only)
+		forceBackgroundSTUN                  = has(nodecap.DebugForceBackgroundSTUN)
+		peerMTUEnable                        = has(nodecap.PeerMTUEnable)
+		dnsForwarderDisableTCPRetries        = has(nodecap.DNSForwarderDisableTCPRetries)
+		silentDisco                          = has(nodecap.SilentDisco)
+		forceIPTables                        = has(nodecap.LinuxMustUseIPTables)
+		forceNfTables                        = has(nodecap.LinuxMustUseNfTables)
+		probeUDPLifetime                     = has(nodecap.ProbeUDPLifetime)
+		appCStoreRoutes                      = has(nodecap.StoreAppCRoutes)
+		userDialUseRoutes                    = has(nodecap.UserDialUseRoutes)
+		disableSplitDNSWhenNoCustomResolvers = has(nodecap.DisableSplitDNSWhenNoCustomResolvers)
+		disableLocalDNSOverrideViaNRPT       = has(nodecap.DisableLocalDNSOverrideViaNRPT)
+		disableCaptivePortalDetection        = has(nodecap.DisableCaptivePortalDetection)
+		disableSkipStatusQueue               = has(nodecap.DisableSkipStatusQueue)
+		disableHostsFileUpdates              = has(nodecap.DisableHostsFileUpdates)
+		forceRegisterMagicDNSIPv4Only        = has(nodecap.ForceRegisterMagicDNSIPv4Only)
+		emitRuntimeMetrics                   = has(nodecap.EmitRuntimeMetrics)
+		disableUDPGRO                        = has(nodecap.DisableUDPGRO)
+		disableUDPGSO                        = has(nodecap.DisableUDPGSO)
+		disableTUNUDPGRO                     = has(nodecap.DisableTUNUDPGRO)
+		disableTUNTCPGRO                     = has(nodecap.DisableTUNTCPGRO)
+		neverGSOEqualTail                    = has(nodecap.NeverGSOEqualTail)
+		cacheNetworkMaps                     = has(nodecap.CacheNetworkMaps)
+		scopeQuad100OnMacOS                  = has(nodecap.ScopeQuad100OnMacOS)
 	)
 
-	if has(tailcfg.NodeAttrOneCGNATEnable) {
+	if has(nodecap.OneCGNATEnable) {
 		oneCGNAT.Set(true)
-	} else if has(tailcfg.NodeAttrOneCGNATDisable) {
+	} else if has(nodecap.OneCGNATDisable) {
 		oneCGNAT.Set(false)
 	}
 
@@ -166,6 +212,14 @@ func (k *Knobs) UpdateFromNodeAttributes(capMap tailcfg.NodeCapMap) {
 	k.DisableSkipStatusQueue.Store(disableSkipStatusQueue)
 	k.DisableHostsFileUpdates.Store(disableHostsFileUpdates)
 	k.ForceRegisterMagicDNSIPv4Only.Store(forceRegisterMagicDNSIPv4Only)
+	k.EmitRuntimeMetrics.Store(emitRuntimeMetrics)
+	k.DisableUDPGRO.Store(disableUDPGRO)
+	k.DisableUDPGSO.Store(disableUDPGSO)
+	k.DisableTUNUDPGRO.Store(disableTUNUDPGRO)
+	k.DisableTUNTCPGRO.Store(disableTUNTCPGRO)
+	k.NeverGSOEqualTail.Store(neverGSOEqualTail)
+	k.CacheNetworkMaps.Store(cacheNetworkMaps)
+	k.ScopeQuad100OnMacOS.Store(scopeQuad100OnMacOS)
 }
 
 // AsDebugJSON returns k as something that can be marshalled with json.Marshal
